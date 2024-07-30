@@ -1,7 +1,9 @@
+from src.game_constants import *
+from src.vision import get_debug_color, grab_screen, Bounds
+from src.util import *
+
 import numpy as np
-import cv2
-from PIL import ImageGrab, Image
-import matplotlib.pyplot as plt
+from PIL import Image
 from funcy import print_durations
 import tkinter as tk
 import threading
@@ -10,129 +12,9 @@ from pynput import keyboard, mouse
 from time import sleep, perf_counter
 import traceback
 
-# constants
-undiscoveredRoomColor = np.array([0, 0, 0])
-undiscovered_room_color_max_deviation = 15
-undiscovered_room_border_mean_color = np.array([0, 220, 0])
-undiscovered_room_border_color_max_deviation = 40
-min_room_match = 0.7
-min_room_size = (50, 50)
-healing_color_low = np.array([0, 90, 1])
-healing_color_high = np.array([1, 255, 2])
-healing_button_min_pixels = 200
-stimpak_color_ratio = 0.9
-stimpak_min_clean_colors = 0.75
-antirad_color_ratio = 0.95
-antirad_min_clean_colors = 0.8
-levelup_color_ratio = 0
-levelup_min_clean_colors = 0.8
-color_ratio_tolerance = 0.15
-critical_cue_color = np.array([253, 222, 0])
-critical_cue_fragment_min_pixels = 25
-critical_hit_color = np.array([17, 243, 20])
-critical_hit_color_deviation = 10
-
-# configuration
-debug_show_progress_visuals = True
-debug_show_progress_log = True
-debug_show_result_visuals = True
-debug_show_result_log = True
-
-def progress_log(str):
-    if debug_show_progress_log: print(f'[PDEBUG] {str}')
-
-def result_log(str):
-    if debug_show_result_log: print(f'[RDEBUG] {str}')
-
-@print_durations
-def grabRealScreen(rect):
-    if rect is not None:
-        rect = rect[:]
-        rect[2] += 1; rect[3] += 1
-    return np.array(ImageGrab.grab(rect))
-
-grabScreen = grabRealScreen
-
-def ccw90(v):
-    return np.array([v[1], -v[0]], dtype=v.dtype)
-
-def cw90(v): # lmao
-    return ccw90(ccw90(ccw90(v)))
-
 def get_room_type(room, loc):
     if loc != 'full': return 'unknown'
     return 'elevator' if room.width < room.height else 'room'
-
-DIRECTIONS = {
-    'left': (0, -1),
-    'right': (0, 1),
-    'up': (-1, 0),
-    'down': (1, 0)
-}
-
-COLORS = (np.array([plt.get_cmap('rainbow', 10)(i) for i in np.linspace(0, 1, 10)]) * 255).astype(int)
-
-class Bounds:
-    def __init__(self, x_min, y_min, x_max, y_max):
-        self.x_min = x_min
-        self.y_min = y_min
-        self.x_max = x_max
-        self.y_max = y_max
-        self.width = self.x_max - self.x_min + 1
-        self.height = self.y_max - self.y_min + 1
-        self.x = (x_min + x_max) // 2
-        self.y = (y_min + y_max) // 2
-        self.area = self.width * self.height
-
-    def from_rect(x, y, width, height):
-        return Bounds(x, y, x + width - 1, y + height - 1)
-
-    def from_center(x, y, width, height):
-        x_min = x - width // 2
-        y_min = y - height // 2
-        return Bounds.from_rect(x_min, y_min, width, height)
-
-    def get_scaled_from_center(self, scale):
-        half_width = int(scale * self.width / 2)
-        half_height = int(scale * self.height / 2)
-        return Bounds(self.x - half_width, self.y - half_height, self.x + half_width, self.y + half_height)
-    
-    def contains_bounds(self, bounds):
-        if self.x_max < bounds.x_max or bounds.x_min < self.x_min: return False
-        if self.y_max < bounds.y_max or bounds.y_min < self.y_min: return False
-        return True
-
-    def to_slice(self):
-        return (slice(self.y_min, self.y_max + 1), slice(self.x_min, self.x_max + 1))
-
-    def get_bbox(self): return [self.x_min, self.y_min, self.x_max, self.y_max]
-
-    def __str__(self):
-        return f'(Bounds) x: {self.x} y: {self.y}; {self.width}x{self.height}'
-
-class Fragment:
-    def __init__(self, source_pixels, mask, value, rect):
-        self.points = np.array(np.where(mask == value)).T
-        self.fragment_value = value
-        self.point_count = len(self.points)
-        self.bounds = Bounds.from_rect(*rect)
-        self.source_patch = source_pixels[self.bounds.to_slice()]
-        self.patch_mask = np.zeros(self.source_patch.shape[:2], dtype=bool)
-        self.patch_mask[self.points[:,0] - self.bounds.y_min, self.points[:,1] - self.bounds.x_min] = True
-        self.masked_patch = self.source_patch * self.patch_mask[:,:,np.newaxis]
-
-def count_matching_pixels(bitmap):
-    return np.sum(bitmap)
-
-def tolerant_compare(observed, target, tolerance):
-    return observed >= target - tolerance and observed <= target + tolerance
-
-def detect_fragment(pixels, x, y, mask, value, matching_mask):
-    _, _, _, rect = cv2.floodFill(mask, matching_mask, (x, y), value, 255, 255, cv2.FLOODFILL_FIXED_RANGE)
-    return Fragment(pixels, mask, value, rect)
-
-def fragment_mask_prepare(mask):
-    return np.pad(np.logical_not(mask), 1, 'constant', constant_values=True).astype(np.uint8)
 
 # (room_type, location, bounds)
 @print_durations()
@@ -146,6 +28,7 @@ def detect_rooms(pixels):
     fragments_mask = fragment_mask_prepare(fragments_mask)
 
     def analyze_room(fragment):
+        fragment.compute(source_patch=True, patch_mask=True)
         bounds = fragment.bounds
 
         total_border = fragment.point_count
@@ -209,7 +92,7 @@ def detect_med_buttons(pixels):
 
     def get_icon_checker(name, target_color_ratio, color_ratio_tolerance, min_clean_colors):
         def _func(fragment, color_ratio, clean_color_fraction):
-            if tolerant_compare(color_ratio, target_color_ratio, color_ratio_tolerance) and clean_color_fraction >= min_clean_colors:
+            if abs(color_ratio - target_color_ratio) <= color_ratio_tolerance and clean_color_fraction >= min_clean_colors:
                 result_log(f'{name} detected at {fragment.bounds}')
                 detected.append((name, fragment.bounds))
                 return True
@@ -227,8 +110,9 @@ def detect_med_buttons(pixels):
         fragment = detect_fragment(pixels, x, y, mask, fragment_index, fragments_mask)
         fragment_index += 1
 
-        low_color_count = count_matching_pixels(np.all(fragment.masked_patch == healing_color_low, axis=2))
-        high_color_count = count_matching_pixels(np.all(fragment.masked_patch == healing_color_high, axis=2))
+        fragment.compute(masked_patch=True)
+        low_color_count = np.sum(np.all(fragment.masked_patch == healing_color_low, axis=2))
+        high_color_count = np.sum(np.all(fragment.masked_patch == healing_color_high, axis=2))
         clean_color_fraction = (low_color_count + high_color_count) / fragment.point_count
         if high_color_count == 0:
             progress_log(f'Skipped fragment due to 0 high color contents')
@@ -236,7 +120,7 @@ def detect_med_buttons(pixels):
         color_ratio = low_color_count / high_color_count
 
         if debug_show_progress_visuals:
-            debug_output[mask == fragment.fragment_value] = COLORS[fragment_index % len(COLORS)]
+            debug_output[mask == fragment.fragment_value] = get_debug_color(fragment_index)
         progress_log(f'New fragment: ratio: {color_ratio * 100:0.2f}%; {clean_color_fraction * 100:0.2f}% clean colors')
 
         if fragment.point_count < healing_button_min_pixels: continue
@@ -250,7 +134,7 @@ def detect_med_buttons(pixels):
         else: continue
 
         if debug_show_result_visuals:
-            debug_output[mask == fragment.fragment_value] = COLORS[fragment_index % len(COLORS)]
+            debug_output[mask == fragment.fragment_value] = get_debug_color(fragment_index)
     
     return detected, debug_output
 
@@ -278,7 +162,7 @@ def detect_critical_button(pixels):
         fragments.append(fragment)
         progress_log(f'Detected critical cue fragment: {fragment.point_count} pixel count')
         if debug_show_progress_visuals:
-            debug_output[mask == fragment.fragment_value] = COLORS[fragment_index % len(COLORS)]
+            debug_output[mask == fragment.fragment_value] = get_debug_color(fragment_index)
 
     assigned_fragments = [False] * len(fragments)
     index = 0
@@ -343,7 +227,7 @@ def make_async_task(f):
 
     return _func
 
-screen = grabScreen(None)
+screen = grab_screen(None)
 screen_shape = np.array(screen.shape[:2])
 screen_shape_xy = screen_shape[::-1]
 screen_center_xy = screen_shape_xy // 2
@@ -437,7 +321,7 @@ def update_overlay(image=0):
 def no_overlay_grab_screen(rect=None):
     hide_overlay()
     sleep(0.01)
-    screen = grabScreen(rect)
+    screen = grab_screen(rect)
     show_overlay()
     return screen
 
@@ -462,27 +346,19 @@ def start_detect_rooms():
     rooms, do = detect_rooms(no_overlay_grab_screen())
     update_overlay(do)
 
+diff_image = no_overlay_grab_screen(None)
 def start_diff_visualize():
+    global diff_image
     print('Starting diff detection...')
-    
-    image = no_overlay_grab_screen(None)
-    sleep(0.05)
     image2 = no_overlay_grab_screen(None)
 
     do = np.zeros_like(FSA_overlay)
-    diff = np.any(image != image2, axis=2)
+    diff = np.any(diff_image != image2, axis=2)
     do[:, :, 3] = do[:, :, 0] = diff * 255
+    diff_image = image2
 
     update_overlay(do)
     sleep(0.2)
-
-def are_opposite(direction, other_direction):
-    if set([direction, other_direction]) == set(['left', 'right']): return True
-    if set([direction, other_direction]) == set(['up', 'down']): return True
-    return False
-
-def is_vertical(direction: str) -> bool: return direction == 'up' or direction == 'down'
-def is_horizontal(direction: str) -> bool: return direction == 'left' or direction == 'right'
 
 def direction_to_screen_center(loc: Bounds, blocked: str):
     if not is_horizontal(blocked):
@@ -533,7 +409,7 @@ def navigate_to_room(room_bounds, click=True):
 
     direction = direction_to_screen_center(room_bounds, blocked_direction)
     while direction is not None:
-        if are_opposite(last_direction, direction): pan_duration /= 2
+        if are_opposite_directions(last_direction, direction): pan_duration /= 2
 
         print(f'Panning now: {direction}')    
         pan_camera(direction, pan_duration)
@@ -577,7 +453,7 @@ def make_critical_strike(crit_bounds):
     grab_bbox = grab_bounds.get_bbox()
 
     def get_crit_stats():
-        img = grabScreen(grab_bbox)
+        img = grab_screen(grab_bbox)
         yp = np.sum(img == critical_cue_color)
         gp = np.sum(np.abs(img - critical_hit_color) < critical_hit_color_deviation)
         return yp, gp
