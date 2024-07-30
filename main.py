@@ -7,7 +7,7 @@ import tkinter as tk
 import threading
 import io
 from pynput import keyboard, mouse
-from time import sleep
+from time import sleep, perf_counter
 import traceback
 
 # constants
@@ -28,7 +28,9 @@ levelup_color_ratio = 0
 levelup_min_clean_colors = 0.8
 color_ratio_tolerance = 0.15
 critical_cue_color = np.array([253, 222, 0])
-critical_cue_fragment_min_pixels = 50
+critical_cue_fragment_min_pixels = 25
+critical_hit_color = np.array([17, 243, 20])
+critical_hit_color_deviation = 10
 
 # configuration
 debug_show_progress_visuals = True
@@ -82,6 +84,14 @@ class Bounds:
         self.y = (y_min + y_max) // 2
         self.area = self.width * self.height
 
+    def from_rect(x, y, width, height):
+        return Bounds(x, y, x + width - 1, y + height - 1)
+
+    def from_center(x, y, width, height):
+        x_min = x - width // 2
+        y_min = y - height // 2
+        return Bounds.from_rect(x_min, y_min, width, height)
+
     def get_scaled_from_center(self, scale):
         half_width = int(scale * self.width / 2)
         half_height = int(scale * self.height / 2)
@@ -101,19 +111,15 @@ class Bounds:
         return f'(Bounds) x: {self.x} y: {self.y}; {self.width}x{self.height}'
 
 class Fragment:
-    def __init__(self, source_pixels, fragment_points, value):
-        self.points = np.array(fragment_points)
+    def __init__(self, source_pixels, mask, value, rect):
+        self.points = np.array(np.where(mask == value)).T
         self.fragment_value = value
-        self.point_count = len(fragment_points)
-        self.min_x = np.min(self.points[:, 1])
-        self.min_y = np.min(self.points[:, 0])
-        self.max_x = np.max(self.points[:, 1])
-        self.max_y = np.max(self.points[:, 0])
-        self.source_patch = source_pixels[self.min_y:self.max_y+1, self.min_x:self.max_x+1]
+        self.point_count = len(self.points)
+        self.bounds = Bounds.from_rect(*rect)
+        self.source_patch = source_pixels[self.bounds.to_slice()]
         self.patch_mask = np.zeros(self.source_patch.shape[:2], dtype=bool)
-        self.patch_mask[self.points[:,0] - self.min_y, self.points[:,1] - self.min_x] = True
+        self.patch_mask[self.points[:,0] - self.bounds.y_min, self.points[:,1] - self.bounds.x_min] = True
         self.masked_patch = self.source_patch * self.patch_mask[:,:,np.newaxis]
-        self.bounds = Bounds(self.min_x, self.min_y, self.max_x, self.max_y)
 
 def count_matching_pixels(bitmap):
     return np.sum(bitmap)
@@ -121,24 +127,12 @@ def count_matching_pixels(bitmap):
 def tolerant_compare(observed, target, tolerance):
     return observed >= target - tolerance and observed <= target + tolerance
 
-# up direction is when y is decreasing :)
-def bfs_mark(pixels, x, y, mask, value, target_mask, exclude_directions=[]):
-    queue = [(y, x)]
-    fragment = []
-    directions = [DIRECTIONS[x] for x in DIRECTIONS if x not in exclude_directions]
-    local_mask = np.zeros_like(mask, dtype=bool)
-    
-    while len(queue) > 0:
-        point = queue.pop(0)
-        # check point is in bounds
-        if not np.all([point[j] in range(pixels.shape[j]) for j in range(2)]): continue
-        if mask[*point] > 0 or local_mask[*point] or not target_mask[*point]: continue
-        local_mask[*point] = True
-        fragment.append(point)
-        mask[*point] = value
-        queue += [(point[0] + j, point[1] + i) for j, i in directions]
-    
-    return Fragment(pixels, fragment, value)
+def detect_fragment(pixels, x, y, mask, value, matching_mask):
+    _, _, _, rect = cv2.floodFill(mask, matching_mask, (x, y), value, 255, 255, cv2.FLOODFILL_FIXED_RANGE)
+    return Fragment(pixels, mask, value, rect)
+
+def fragment_mask_prepare(mask):
+    return np.pad(np.logical_not(mask), 1, 'constant', constant_values=True).astype(np.uint8)
 
 # (room_type, location, bounds)
 @print_durations()
@@ -149,6 +143,7 @@ def detect_rooms(pixels):
 
     fragments_mask = np.sum(np.abs(pixels - undiscovered_room_border_mean_color), axis=2) < undiscovered_room_border_color_max_deviation
     ys, xs = np.where(fragments_mask)
+    fragments_mask = fragment_mask_prepare(fragments_mask)
 
     def analyze_room(fragment):
         bounds = fragment.bounds
@@ -178,7 +173,7 @@ def detect_rooms(pixels):
     fragment_index = 1
     for x, y in zip(xs, ys):
         if mask[y, x] > 0: continue
-        fragment = bfs_mark(pixels, x, y, mask, fragment_index, fragments_mask)
+        fragment = detect_fragment(pixels, x, y, mask, fragment_index, fragments_mask)
         fragment_index += 1
         if fragment.bounds.width < min_room_size[0] or fragment.bounds.height < min_room_size[1]: continue
 
@@ -209,6 +204,7 @@ def detect_med_buttons(pixels):
 
     fragments_mask = np.all(np.logical_and(pixels <= healing_color_high, pixels >= healing_color_low), axis=2)
     ys, xs = np.where(fragments_mask)
+    fragments_mask = fragment_mask_prepare(fragments_mask)
     detected = []
 
     def get_icon_checker(name, target_color_ratio, color_ratio_tolerance, min_clean_colors):
@@ -228,7 +224,7 @@ def detect_med_buttons(pixels):
     fragment_index = 1
     for x, y in zip(xs, ys):
         if mask[y, x] > 0: continue
-        fragment = bfs_mark(pixels, x, y, mask, fragment_index, fragments_mask)
+        fragment = detect_fragment(pixels, x, y, mask, fragment_index, fragments_mask)
         fragment_index += 1
 
         low_color_count = count_matching_pixels(np.all(fragment.masked_patch == healing_color_low, axis=2))
@@ -264,15 +260,18 @@ def detect_critical_button(pixels):
     debug_output = np.zeros((*pixels.shape[:2], 4), dtype=int)
     mask = np.zeros(pixels.shape[:2], dtype=int)
 
-    fragment_mask = np.all(pixels == critical_cue_color, axis=2)
-    ys, xs = np.where(fragment_mask)
+    fragments_mask = np.all(pixels == critical_cue_color, axis=2)
+    ys, xs = np.where(fragments_mask)
+    if len(xs) < critical_cue_fragment_min_pixels * 9: return [], debug_output
+
+    fragments_mask = fragment_mask_prepare(fragments_mask)
     detected = []
 
     fragment_index = 1
     fragments = []
     for x, y in zip(xs, ys):
         if mask[y, x] > 0: continue
-        fragment = bfs_mark(pixels, x, y, mask, fragment_index, fragment_mask)
+        fragment = detect_fragment(pixels, x, y, mask, fragment_index, fragments_mask)
         fragment_index += 1
 
         if fragment.point_count < critical_cue_fragment_min_pixels: continue
@@ -319,7 +318,7 @@ print('Welcome to FSA! Initializing...')
 
 update_interval = 20
 camera_pan_deadzone = 0.1
-camera_pan_initial_duration = 0.2
+camera_pan_initial_duration = 0.1
 
 task_in_progress = False
 shortcut_chord_pending = False
@@ -397,15 +396,15 @@ def chord_handler(key):
             current_execution_target = start_battle_detect
         elif key.char == 'g':
             mission_ctl = True
+        elif key.char == 'p':
+            current_execution_target = start_diff_visualize
 
 root = tk.Tk()
 root.attributes('-fullscreen', True)
 root.attributes('-transparentcolor','#f0f0f0')
 root.attributes("-topmost", True)
 
-overlay = tk.PhotoImage(file="./resources/test_overlay.png")
-panel = tk.Label(root, image=overlay)
-panel.pack(side="bottom", fill="both", expand="yes")
+panel = tk.Label(root)
 keyboard_input = keyboard.Controller()
 mouse_input = mouse.Controller()
 
@@ -413,13 +412,16 @@ def update():
     global current_execution_target, task_in_progress
 
     if terminate_pending: 
-        quit()
         print('Terminating...')
+        quit()
     root.after(update_interval, update)
     if current_execution_target is not None and not task_in_progress:
         task_in_progress = True
         task = threading.Thread(target=make_async_task(current_execution_target), daemon=True)
         task.start()
+
+def show_overlay(): panel.pack(side="bottom", fill="both", expand="yes")
+def hide_overlay(): panel.pack_forget()
 
 def update_overlay(image=0):
     image_data = np.clip(image + FSA_overlay, 0, 255).astype(np.uint8)
@@ -430,13 +432,13 @@ def update_overlay(image=0):
         panel.configure(image=new_overlay)
         panel.image = new_overlay
     
-    panel.pack(side="bottom", fill="both", expand="yes")
-
+    show_overlay()
+    
 def no_overlay_grab_screen(rect=None):
-    panel.pack_forget()
+    hide_overlay()
     sleep(0.01)
     screen = grabScreen(rect)
-    panel.pack(side="bottom", fill="both", expand="yes")
+    show_overlay()
     return screen
 
 def start_detect_meds():
@@ -459,6 +461,20 @@ def start_detect_rooms():
     print('Starting rooms detection...')
     rooms, do = detect_rooms(no_overlay_grab_screen())
     update_overlay(do)
+
+def start_diff_visualize():
+    print('Starting diff detection...')
+    
+    image = no_overlay_grab_screen(None)
+    sleep(0.05)
+    image2 = no_overlay_grab_screen(None)
+
+    do = np.zeros_like(FSA_overlay)
+    diff = np.any(image != image2, axis=2)
+    do[:, :, 3] = do[:, :, 0] = diff * 255
+
+    update_overlay(do)
+    sleep(0.2)
 
 def are_opposite(direction, other_direction):
     if set([direction, other_direction]) == set(['left', 'right']): return True
@@ -502,9 +518,9 @@ def restore_offset(bounds, clip_bounds):
 
 def mouse_click(x, y):
     mouse_input.position = (x, y)
-    sleep(0.05)
+    sleep(0.07)
     mouse_input.press(mouse.Button.left)
-    sleep(0.1)
+    sleep(0.12)
     mouse_input.release(mouse.Button.left)
 
 def navigate_to_room(room_bounds, click=True):
@@ -525,8 +541,12 @@ def navigate_to_room(room_bounds, click=True):
         last_bounds = room_bounds
     
         bbox = get_panning_bbox(room_bounds, direction)
-        while True:
+        start_time = perf_counter()
+        while True: # put iteration limit?
             rooms, do = detect_rooms(no_overlay_grab_screen(bbox))
+            if perf_counter() - start_time > 2:
+                print('Panning failed: timeout')
+                return False # timeout
             if len(rooms) > 0: break
 
         room_bounds = restore_offset(rooms[0][2], bbox)
@@ -549,6 +569,31 @@ def navigate_to_room(room_bounds, click=True):
         print(f'Clicking: {room_bounds.x, room_bounds.y}')
         mouse_click(room_bounds.x, room_bounds.y)
 
+    return True
+
+def make_critical_strike(crit_bounds):
+    grab_size = min(crit_bounds.width, crit_bounds.height) // 3
+    grab_bounds = Bounds.from_center(crit_bounds.x, crit_bounds.y, grab_size, grab_size)
+    grab_bbox = grab_bounds.get_bbox()
+
+    def get_crit_stats():
+        img = grabScreen(grab_bbox)
+        yp = np.sum(img == critical_cue_color)
+        gp = np.sum(np.abs(img - critical_hit_color) < critical_hit_color_deviation)
+        return yp, gp
+    
+    print('Starting crit scoring...')
+    last_cue_pixels, last_crit_pixels = get_crit_stats()
+    while last_cue_pixels > 10:
+        cue_pixels, crit_pixels = get_crit_stats()
+        if cue_pixels < last_cue_pixels and crit_pixels > last_crit_pixels:
+            mouse_input.press(mouse.Button.left)
+            sleep(0.1)
+            mouse_input.release(mouse.Button.left)
+            break
+
+        last_cue_pixels, last_crit_pixels = cue_pixels, crit_pixels
+
 def battle_iteration():
     screen = no_overlay_grab_screen()
     meds, do = detect_med_buttons(screen)
@@ -563,10 +608,13 @@ def battle_iteration():
         print('Clicking crits...')
         mouse_click(bounds.x, bounds.y)
         sleep(0.3)
-        mouse_click(bounds.x, bounds.y)
+        make_critical_strike(bounds)
         sleep(0.8)
 
 def same_rooms(rooms1, rooms2):
+    if rooms1 is None and rooms2 is None: return True
+    if rooms1 is None: return len(rooms2) == 0
+    if rooms2 is None: return len(rooms1) == 0
     if len(rooms1) != len(rooms2): return False
     for room1, room2 in zip(rooms1, rooms2):
         if room1[2].x != room2[2].x: return False
@@ -575,6 +623,10 @@ def same_rooms(rooms1, rooms2):
         if room1[2].height != room2[2].height: return False
     
     return True
+
+def zoom_out():
+    for _ in range(20):
+        mouse_input.scroll(0, -1)
 
 def mission_script():
     global script_running, current_execution_target, mission_ctl
@@ -585,47 +637,26 @@ def mission_script():
     script_running = True
     current_execution_target = None
 
-    while True:
-        rooms, do = detect_rooms(no_overlay_grab_screen())
-        if len(rooms) > 0: break
-
-    print(f'Found room: {rooms[0][2]}, type: {rooms[0][0]}')
-    navigate_to_room(rooms[0][2])
-    sleep(0.4)
-
-    last_rooms = detect_rooms(no_overlay_grab_screen())[0]
+    last_rooms = None
     while True:
         battle_iteration()
         
+        zoom_out()
         rooms, do = detect_rooms(no_overlay_grab_screen())
 
-        if same_rooms(last_rooms, rooms): continue
-        if len(rooms) == 0: continue
+        if same_rooms(last_rooms, rooms) or len(rooms) == 0: continue
 
-        print(f'Found room: {rooms[0][2]}, type: {rooms[0][0]}')
-        navigate_to_room(rooms[0][2])
-        sleep(0.4)
-        last_rooms = detect_rooms(no_overlay_grab_screen())[0]
-
-
-
-
-    print('Now waiting...')
-
-    # test code
-    while True:
-        sleep(0.1)
-        if not mission_ctl: continue
-        
         while True:
-            rooms, do = detect_rooms(no_overlay_grab_screen())
-            if len(rooms) > 0: break
+            print(f'Found room: {rooms[0][2]}, type: {rooms[0][0]}')
+            navigate_succesfull = navigate_to_room(rooms[0][2])
+            sleep(0.4)
+            last_rooms = detect_rooms(no_overlay_grab_screen())[0]
+            if navigate_succesfull: break
 
-        print(f'Found room: {rooms[0][2]}, type: {rooms[0][0]}')
-        navigate_to_room(rooms[0][2])
-
-        print('Now waiting...')
-        mission_ctl = False
+            while True:
+                zoom_out()
+                rooms, do = detect_rooms(no_overlay_grab_screen())
+                if len(rooms) > 0: break
 
     print('>>> Mission script complete')
     script_running = False
