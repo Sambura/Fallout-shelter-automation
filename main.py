@@ -1,5 +1,5 @@
 from src.game_constants import *
-from src.vision import get_debug_color, grab_screen, Bounds
+from src.vision import get_debug_color, grab_screen, detect_fragment, fragment_mask_prepare, Bounds
 from src.util import *
 
 import numpy as np
@@ -11,6 +11,8 @@ import io
 from pynput import keyboard, mouse
 from time import sleep, perf_counter
 import traceback
+import os
+import datetime
 
 def get_room_type(room, loc):
     if loc != 'full': return 'unknown'
@@ -62,7 +64,7 @@ def detect_rooms(pixels):
 
         fragments.append(fragment)
 
-        progress_log(f'New room fragment: {fragment.bounds}')
+        # progress_log(f'New room fragment: {fragment.bounds}')
         if debug_show_progress_visuals:
             debug_output[mask == fragment.fragment_value] = 70
 
@@ -73,7 +75,7 @@ def detect_rooms(pixels):
 
         rooms_detected.append((room_type, location, fragment.bounds))
 
-        result_log(f'Room detected! {fragment.bounds} : {room_type}, location: {location}')
+        # result_log(f'Room detected! {fragment.bounds} : {room_type}, location: {location}')
         if debug_show_result_visuals:
             debug_output[fragment.bounds.to_slice()] += np.array([255, 0, 255, 100])
 
@@ -160,7 +162,7 @@ def detect_critical_button(pixels):
 
         if fragment.point_count < critical_cue_fragment_min_pixels: continue
         fragments.append(fragment)
-        progress_log(f'Detected critical cue fragment: {fragment.point_count} pixel count')
+        # progress_log(f'Detected critical cue fragment: {fragment.point_count} pixel count')
         if debug_show_progress_visuals:
             debug_output[mask == fragment.fragment_value] = get_debug_color(fragment_index)
 
@@ -192,8 +194,6 @@ def detect_critical_button(pixels):
 
     return detected, debug_output
 
-def mission_script(): pass
-
 ###
 ### ======================== MAIN ========================
 ### 
@@ -203,6 +203,7 @@ print('Welcome to FSA! Initializing...')
 update_interval = 20
 camera_pan_deadzone = 0.1
 camera_pan_initial_duration = 0.1
+crit_wait_count = 4
 
 task_in_progress = False
 shortcut_chord_pending = False
@@ -210,6 +211,7 @@ terminate_pending = False
 script_running = False
 current_execution_target = None
 mission_ctl = False
+show_log = True
 
 def update_overlay(param): pass
 
@@ -227,8 +229,8 @@ def make_async_task(f):
 
     return _func
 
-screen = grab_screen(None)
-screen_shape = np.array(screen.shape[:2])
+screen_img = grab_screen(None)
+screen_shape = np.array(screen_img.shape[:2])
 screen_shape_xy = screen_shape[::-1]
 screen_center_xy = screen_shape_xy // 2
 FSA_overlay = np.ones((*screen_shape, 4), dtype=np.uint8) * np.array([255, 0, 0, 255])
@@ -248,9 +250,10 @@ def terminate():
 def start_chord():
     global shortcut_chord_pending
     shortcut_chord_pending = True
+    progress_log('Waiting for chord completion...')
 
 def chord_handler(key):
-    global shortcut_chord_pending, current_execution_target, mission_ctl
+    global shortcut_chord_pending, current_execution_target, mission_ctl, show_log
     if script_running and key == keyboard.Key.esc: 
         terminate()
 
@@ -282,15 +285,32 @@ def chord_handler(key):
             mission_ctl = True
         elif key.char == 'p':
             current_execution_target = start_diff_visualize
+        elif key.char == 'l':
+            show_log = not show_log
 
 root = tk.Tk()
 root.attributes('-fullscreen', True)
 root.attributes('-transparentcolor','#f0f0f0')
-root.attributes("-topmost", True)
+root.attributes("-topmost", True)   
+
+log(
+'''Start mission script: Ctrl + F; Enter (Esc to terminate)
+Toggle log display: Ctrl + F; L
+Shutdown: Ctrl + F; Esc
+''')
 
 panel = tk.Label(root)
+log_label = tk.Label(root, text='Error text...', background='#000000', foreground='#44dd11', justify='left')
+log_label.pack(side='left')
+
 keyboard_input = keyboard.Controller()
 mouse_input = mouse.Controller()
+
+launch_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+output_folder = f'output/{launch_time}/'
+os.makedirs(output_folder)
+result_log(f"Output folder created: {output_folder}")
+output_index = 0
 
 def update():
     global current_execution_target, task_in_progress
@@ -299,13 +319,16 @@ def update():
         print('Terminating...')
         quit()
     root.after(update_interval, update)
+    log_label.config(text=get_current_log())
     if current_execution_target is not None and not task_in_progress:
         task_in_progress = True
         task = threading.Thread(target=make_async_task(current_execution_target), daemon=True)
         task.start()
 
-def show_overlay(): panel.pack(side="bottom", fill="both", expand="yes")
-def hide_overlay(): panel.pack_forget()
+def show_overlay(): 
+    panel.place(relheight=1, relwidth=1); 
+    if show_log: log_label.pack(side='left')
+def hide_overlay(): panel.place_forget(); log_label.pack_forget()
 
 def update_overlay(image=0):
     image_data = np.clip(image + FSA_overlay, 0, 255).astype(np.uint8)
@@ -319,37 +342,39 @@ def update_overlay(image=0):
     show_overlay()
     
 def no_overlay_grab_screen(rect=None):
+    global screen_img
     hide_overlay()
     sleep(0.01)
     screen = grab_screen(rect)
+    if rect is None: screen_img = screen
     show_overlay()
     return screen
 
 def start_detect_meds():
-    print('Starting meds detection...')
+    result_log('Starting meds detection...')
     meds, do = detect_med_buttons(no_overlay_grab_screen())
     update_overlay(do)
 
 def start_detect_crit():
-    print('Starting critical cue detection...')
+    result_log('Starting critical cue detection...')
     crits, do = detect_critical_button(no_overlay_grab_screen())
     update_overlay(do)
 
 def start_battle_detect():
-    print('Starting battle cues detection...')
+    result_log('Starting battle cues detection...')
     crits, do1 = detect_critical_button(no_overlay_grab_screen())
     meds, do2 = detect_med_buttons(no_overlay_grab_screen())
     update_overlay(do1 + do2)
 
 def start_detect_rooms():
-    print('Starting rooms detection...')
+    result_log('Starting rooms detection...')
     rooms, do = detect_rooms(no_overlay_grab_screen())
     update_overlay(do)
 
 diff_image = no_overlay_grab_screen(None)
 def start_diff_visualize():
     global diff_image
-    print('Starting diff detection...')
+    result_log('Starting diff detection...')
     image2 = no_overlay_grab_screen(None)
 
     do = np.zeros_like(FSA_overlay)
@@ -399,8 +424,15 @@ def mouse_click(x, y):
     sleep(0.12)
     mouse_input.release(mouse.Button.left)
 
+def log_image(img, postfix, increment_counter=True):
+    global output_index
+    Image.fromarray(img).save(f'{output_folder}/{output_index}-{postfix}.png')
+    if increment_counter: output_index += 1
+
+def debug_log_image(img, postfix, increment_counter=True): log_image(img, postfix, increment_counter)
+
 def navigate_to_room(room_bounds, click=True):
-    print('Navigating to the room...')
+    progress_log('Navigating to the room...')
 
     pan_duration = camera_pan_initial_duration
     last_direction = None
@@ -411,17 +443,20 @@ def navigate_to_room(room_bounds, click=True):
     while direction is not None:
         if are_opposite_directions(last_direction, direction): pan_duration /= 2
 
-        print(f'Panning now: {direction}')    
+        progress_log(f'Panning now: {direction}')    
         pan_camera(direction, pan_duration)
 
         last_bounds = room_bounds
     
         bbox = get_panning_bbox(room_bounds, direction)
         start_time = perf_counter()
+        progress_log(f'Finding room again...')
         while True: # put iteration limit?
-            rooms, do = detect_rooms(no_overlay_grab_screen(bbox))
+            screen_crop = no_overlay_grab_screen(bbox) # how can this be not assigned + the outer loop is terminated??
+            debug_log_image(screen_crop, 'navigation-rescan')
+            rooms, do = detect_rooms(screen_crop)
             if perf_counter() - start_time > 2:
-                print('Panning failed: timeout')
+                progress_log('Panning failed: timeout')
                 return False # timeout
             if len(rooms) > 0: break
 
@@ -431,19 +466,37 @@ def navigate_to_room(room_bounds, click=True):
         # dof[Bounds(*bbox).to_slice()] = do
         # update_overlay(dof)
 
-        print(f'New bounds: {room_bounds}')
+        # progress_log(f'New bounds: {room_bounds}')
         if last_bounds.x == room_bounds.x and last_bounds.y == room_bounds.y:
-            print(f'Panning blocked... `{direction}`')
+            progress_log(f'Panning blocked... `{direction}`')
             if blocked_direction is not None and blocked_direction != direction: break
             blocked_direction = direction
         
         last_direction = direction
         direction = direction_to_screen_center(room_bounds, blocked_direction)
 
-    print('Panning complete')
+    progress_log('Panning complete')
     if click:
-        print(f'Clicking: {room_bounds.x, room_bounds.y}')
-        mouse_click(room_bounds.x, room_bounds.y)
+        for _ in range(5):
+            pre_click_room = no_overlay_grab_screen(room_bounds.get_bbox())
+            progress_log(f'Clicking: {room_bounds.x, room_bounds.y}')
+            mouse_click(room_bounds.x, room_bounds.y)
+            sleep(0.5) # click diff wait
+            post_click_room = no_overlay_grab_screen(room_bounds.get_bbox())
+
+            click_diff = np.sum(np.abs(post_click_room - pre_click_room)) / 3 / room_bounds.area / 255
+
+            progress_log(f'Post-click pixel diff: {click_diff*100:0.2f}%')
+
+            log_image(pre_click_room, 'preclick', increment_counter=False)
+            log_image(post_click_room, 'postclick', increment_counter=False)
+            log_image(np.any(post_click_room != pre_click_room, axis=2), 'clickdiff')
+
+            if click_diff >= 0.01: return True
+            progress_log(f'Click failed, repeat:')
+        
+        progress_log('Gave up on clicking...')
+        return False
 
     return True
 
@@ -451,37 +504,72 @@ def make_critical_strike(crit_bounds):
     grab_size = min(crit_bounds.width, crit_bounds.height) // 3
     grab_bounds = Bounds.from_center(crit_bounds.x, crit_bounds.y, grab_size, grab_size)
     grab_bbox = grab_bounds.get_bbox()
+    hit_times = []
+    debug_grabs = []
 
     def get_crit_stats():
+        ts = perf_counter()
         img = grab_screen(grab_bbox)
-        yp = np.sum(img == critical_cue_color)
-        gp = np.sum(np.abs(img - critical_hit_color) < critical_hit_color_deviation)
-        return yp, gp
+        debug_grabs.append(img)
+        yp = np.sum(np.all(img == critical_progress_color, axis=2))
+        gp = np.sum(np.sum(np.abs(img - critical_hit_color), axis=2) < critical_hit_color_deviation)
+        return ts, yp, gp
     
-    print('Starting crit scoring...')
-    last_cue_pixels, last_crit_pixels = get_crit_stats()
-    while last_cue_pixels > 10:
-        cue_pixels, crit_pixels = get_crit_stats()
-        if cue_pixels < last_cue_pixels and crit_pixels > last_crit_pixels:
-            mouse_input.press(mouse.Button.left)
-            sleep(0.1)
-            mouse_input.release(mouse.Button.left)
-            break
+    progress_log(f'Starting crit scoring: bbox {grab_bbox}')
 
+    # analysis
+
+    min_crit_pixels = 10
+    _, last_cue_pixels, last_crit_pixels = get_crit_stats()
+    crit_over = last_crit_pixels < min_crit_pixels
+    while last_cue_pixels > 10:
+        timestamp, cue_pixels, crit_pixels = get_crit_stats()
+
+        if not crit_over:
+            if crit_pixels < min_crit_pixels:
+                crit_over = True
+            else:
+                progress_log('WARNING: crit double frame') 
+                continue
+
+        if cue_pixels < last_cue_pixels and crit_pixels > last_crit_pixels:
+            hit_times.append(timestamp)
+            crit_over = False
+
+        if len(hit_times) >= crit_wait_count: break
         last_cue_pixels, last_crit_pixels = cue_pixels, crit_pixels
 
-def battle_iteration():
-    screen = no_overlay_grab_screen()
-    meds, do = detect_med_buttons(screen)
-    crits, do = detect_critical_button(screen)
+    if len(hit_times) < 2:
+        progress_log('Crit failed...')
+        return
 
+    avg_diff = np.mean(np.diff(hit_times))
+    next_crit = hit_times[-1]
+
+    for _ in range(10): # limit iteration count to 10
+        if next_crit > perf_counter(): break
+        next_crit += avg_diff
+
+    while perf_counter() < next_crit: sleep(0.0001)
+
+    mouse_input.press(mouse.Button.left)
+    sleep(0.1)
+    mouse_input.release(mouse.Button.left)
+
+    progress_log(f'Crit diff info gathered: {[f"{x:0.2f}" for x in np.diff(hit_times)]}, avg: {avg_diff:0.2f}s')
+
+    for img in debug_grabs: debug_log_image(img, 'crit-scan')
+
+def battle_iteration():
+    meds, do = detect_med_buttons(screen_img)
     for name, bounds in meds:
-        print('Clicking meds...')
+        progress_log('Clicking meds...')
         mouse_click(bounds.x, bounds.y)
         sleep(0.05)
 
+    crits, do = detect_critical_button(screen_img)
     for bounds in crits:
-        print('Clicking crits...')
+        progress_log('Clicking crits...')
         mouse_click(bounds.x, bounds.y)
         sleep(0.3)
         make_critical_strike(bounds)
@@ -503,38 +591,45 @@ def same_rooms(rooms1, rooms2):
 def zoom_out():
     for _ in range(20):
         mouse_input.scroll(0, -1)
+    sleep(0.2)
 
 def mission_script():
     global script_running, current_execution_target, mission_ctl
 
     update_overlay()
-    print('>>> Starting mission script')
-    print('Looking for starting room...')
+    progress_log('>>> Starting mission script')
+    progress_log('Looking for starting room...')
     script_running = True
     current_execution_target = None
 
     last_rooms = None
     while True:
-        battle_iteration()
+        progress_log('General mission iteration...')
         
         zoom_out()
-        rooms, do = detect_rooms(no_overlay_grab_screen())
+        no_overlay_grab_screen()
+        debug_log_image(screen_img, 'iteration-capture')
+        battle_iteration()
+        
+        rooms, do = detect_rooms(screen_img)
 
         if same_rooms(last_rooms, rooms) or len(rooms) == 0: continue
 
         while True:
-            print(f'Found room: {rooms[0][2]}, type: {rooms[0][0]}')
+            progress_log(f'Found room: {rooms[0][2]}, type: {rooms[0][0]}')
             navigate_succesfull = navigate_to_room(rooms[0][2])
             sleep(0.4)
             last_rooms = detect_rooms(no_overlay_grab_screen())[0]
+            debug_log_image(screen_img, 'post-navigation-capture')
             if navigate_succesfull: break
 
             while True:
                 zoom_out()
                 rooms, do = detect_rooms(no_overlay_grab_screen())
+                debug_log_image(screen_img, 'on-navigation-failure-scan')
                 if len(rooms) > 0: break
 
-    print('>>> Mission script complete')
+    progress_log('>>> Mission script complete')
     script_running = False
 
 def run_keyboard_listener():
@@ -549,7 +644,7 @@ def run_keyboard_listener():
         try:
             chord_handler(key) 
         except:
-            print('Listener thread encountered exception:')
+            progress_log('Listener thread encountered exception:')
             traceback.print_exc()
         
         for_canonical(fsa_hotkey.press)(key)
