@@ -25,6 +25,7 @@ class Bounds:
         self.x = (x_min + x_max) // 2
         self.y = (y_min + y_max) // 2
         self.area = self.width * self.height
+        self.shape = (self.height, self.width)
 
     def from_rect(x, y, width, height):
         return Bounds(x, y, x + width - 1, y + height - 1)
@@ -48,6 +49,13 @@ class Bounds:
         return (slice(self.y_min, self.y_max + 1), slice(self.x_min, self.x_max + 1))
 
     def get_bbox(self): return [self.x_min, self.y_min, self.x_max, self.y_max]
+
+    def offset_bounds(self, *offsets):
+        if len(offsets) == 1:
+            v = offsets[0]
+            return Bounds(self.x_min - v, self.y_min - v, self.x_max + v, self.y_max + v)
+
+        raise NotImplementedError('only implemented for 1 parameter for now :(')
 
     def __str__(self):
         return f'(Bounds) x: {self.x} y: {self.y}; {self.width}x{self.height}'
