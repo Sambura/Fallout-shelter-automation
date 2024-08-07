@@ -26,6 +26,7 @@ class Bounds:
         self.y = (y_min + y_max) // 2
         self.area = self.width * self.height
         self.shape = (self.height, self.width)
+        self.pos = np.array([self.x, self.y])
 
     def from_rect(x, y, width, height):
         return Bounds(x, y, x + width - 1, y + height - 1)

@@ -1,11 +1,13 @@
 import numpy as np
 
+# Rooms detection
 undiscoveredRoomColor = np.array([0, 0, 0])
 undiscovered_room_color_max_deviation = 15
 undiscovered_room_border_mean_color = np.array([0, 220, 0])
 undiscovered_room_border_color_max_deviation = 40
 min_room_match = 0.7
 min_room_size = (50, 50)
+
 healing_color_low = np.array([0, 90, 1])
 healing_color_high = np.array([1, 255, 2])
 healing_button_min_pixels = 200
@@ -27,3 +29,16 @@ enemy_healthbar_color_max_deviation = 8
 enemy_healthbar_min_border_pixel_count = 40
 enemy_healthbar_outline_color = np.array([89, 9, 8])
 enemy_healthbar_detect_blending = 0.8
+
+# Detection of room being clicked
+room_click_diff_border_width = 0.09
+
+# walk to new room
+walk_wait_min_interval = 0.5
+room_reached_min_diff = 0.8
+
+# New room analysis
+room_analysis_timeout = 5
+
+# Room scanning
+structural_scan_begin_timeout = 3

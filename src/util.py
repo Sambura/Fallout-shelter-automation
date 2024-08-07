@@ -28,10 +28,13 @@ def truncate_log():
 def get_current_log(lines=60):
     return '\n'.join(current_log[-lines:])
 
+H_DIRECTIONS = ['left', 'right']
+V_DIRECTIONS = ['up', 'down']
+
 def are_opposite_directions(direction, other_direction):
-    if set([direction, other_direction]) == set(['left', 'right']): return True
-    if set([direction, other_direction]) == set(['up', 'down']): return True
+    if set([direction, other_direction]) == set(H_DIRECTIONS): return True
+    if set([direction, other_direction]) == set(V_DIRECTIONS): return True
     return False
 
-def is_vertical(direction: str) -> bool: return direction == 'up' or direction == 'down'
-def is_horizontal(direction: str) -> bool: return direction == 'left' or direction == 'right'
+def is_vertical(direction: str) -> bool: return direction in V_DIRECTIONS
+def is_horizontal(direction: str) -> bool: return direction in H_DIRECTIONS

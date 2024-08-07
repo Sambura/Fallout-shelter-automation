@@ -47,7 +47,7 @@ def detect_blending_pixels(pixels, primary_color, secondary_color, max_blending=
 
 # (room_type, location, bounds)
 @print_durations()
-def detect_rooms(pixels):
+def detect_rooms(pixels, return_fragments=False):
     rooms_detected = []
     mask = np.zeros(pixels.shape[:2], dtype=int)
     debug_output = np.zeros((*pixels.shape[:2], 4), dtype=int)
@@ -95,17 +95,20 @@ def detect_rooms(pixels):
         if debug_show_progress_visuals:
             debug_output[mask == fragment.fragment_value] = 70
 
+    detected_fragments = []
     for fragment in fragments:
         valid_room, location = analyze_room(fragment)
         if not valid_room: continue
         room_type = get_room_type(fragment.bounds, location)
 
         rooms_detected.append((room_type, location, fragment.bounds))
+        detected_fragments.append(fragment)
 
         # result_log(f'Room detected! {fragment.bounds} : {room_type}, location: {location}')
         if debug_show_result_visuals:
             debug_output[fragment.bounds.to_slice()] += np.array([255, 0, 255, 100])
 
+    if return_fragments: return detected_fragments
     return rooms_detected, debug_output
 
 # (med_name, bounds)
@@ -221,6 +224,7 @@ def detect_critical_button(pixels):
 
     return detected, debug_output
 
+# structural fragment, obscured_directions, debug_output
 @print_durations()
 def detect_structural(pixels):
     debug_output = np.zeros((*pixels.shape[:2], 4), dtype=int)
@@ -241,13 +245,21 @@ def detect_structural(pixels):
         if fragment.point_count < critical_cue_fragment_min_pixels: continue
         fragments.append(fragment)
         
-        progress_log(f'Detected structural fragment: {fragment.point_count} pixel count')
+        # progress_log(f'Detected structural fragment: {fragment.point_count} pixel count')
         if debug_show_progress_visuals:
             debug_output[mask == fragment.fragment_value] = get_debug_color(fragment_index)
 
-    best_candidate = max(fragments, key=lambda x: x.point_count)
+    if len(fragments) == 0: return None, None, debug_output
 
-    return best_candidate, debug_output
+    best_candidate = max(fragments, key=lambda x: x.point_count)
+    obscured_directions = []
+    best_candidate.compute(patch_mask=True)
+    if best_candidate.bounds.y_min == 0: obscured_directions.append('down')
+    if best_candidate.bounds.y_max == pixels.shape[0] - 1: obscured_directions.append('up')
+    if best_candidate.bounds.x_min == 0: obscured_directions.append('left')
+    if best_candidate.bounds.x_max == pixels.shape[1] - 1: obscured_directions.append('right')
+
+    return best_candidate, obscured_directions, debug_output
 
 def is_rectangular(fragment: Fragment, report_fraction=False):
     if not hasattr(fragment, 'patch_mask'): fragment.compute(patch_mask=True)
@@ -414,6 +426,7 @@ log_label.pack(side='left')
 
 keyboard_input = keyboard.Controller()
 mouse_input = mouse.Controller()
+CAMERA_PAN_KEYS = { 'left': 'a', 'right': 'd', 'down': 'w', 'up': 's' }
 
 launch_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 output_folder = f'output/{launch_time}/'
@@ -515,8 +528,6 @@ def direction_to_screen_center(loc: Bounds, blocked: str):
 
     return None
 
-CAMERA_PAN_KEYS = { 'left': 'a', 'right': 'd', 'down': 'w', 'up': 's' }
-
 def pan_camera(direction, duration=0.05):
     keyboard_input.press(CAMERA_PAN_KEYS[direction])
     sleep(duration)
@@ -553,6 +564,16 @@ def debug_log_image(img, postfix, increment_counter=True): log_image(img, postfi
 def compute_img_diff_ratio(img1, img2):
     return np.sum(np.any(img1 != img2, axis=2)) / np.prod(img1.shape[:2])
 
+def is_room_click(diff: np.ndarray):
+    border_width = int(room_click_diff_border_width * diff.shape[0])
+    mask = np.ones_like(diff, dtype=bool)
+    mask[border_width:-border_width, border_width:-border_width] = False
+    hh, hw = mask.shape[0] // 2, mask.shape[1] // 2
+    border = np.logical_and(diff, mask)
+
+    # check there are pixels in border area in each of the 4 quadrants
+    return np.any(border[:hh, :hw]) and np.any(border[:hh, hw:]) and np.any(border[hh:, :hw]) and np.any(border[hh:, hw:])
+
 def navigate_to_room(room_bounds, click=True):
     progress_log('Navigating to the room...')
 
@@ -573,6 +594,7 @@ def navigate_to_room(room_bounds, click=True):
         bbox = get_panning_bbox(room_bounds, direction)
         start_time = perf_counter()
         progress_log(f'Finding room again...')
+        sleep(0.1) # post-pan delay
         while True: # put iteration limit?
             screen_crop = no_overlay_grab_screen(bbox) # how can this be not assigned + the outer loop is terminated??
             debug_log_image(screen_crop, 'navigation-rescan')
@@ -583,10 +605,6 @@ def navigate_to_room(room_bounds, click=True):
             if len(rooms) > 0: break
 
         room_bounds = restore_offset(rooms[0][2], bbox)
-
-        # dof = np.zeros_like(FSA_overlay)
-        # dof[Bounds(*bbox).to_slice()] = do
-        # update_overlay(dof)
 
         # progress_log(f'New bounds: {room_bounds}')
         if last_bounds.x == room_bounds.x and last_bounds.y == room_bounds.y:
@@ -599,8 +617,20 @@ def navigate_to_room(room_bounds, click=True):
 
     progress_log('Panning complete')
     if click:
+        sleep(0.1) # post panning delay (camera seems to be panning a bit after a key is released)
+        no_overlay_grab_screen()
+        debug_log_image(screen_img, 'navigation-end-grab')
+        rooms, do = detect_rooms(screen_img)
+        filtered_rooms = [x for _, _, x in rooms if x.shape == room_bounds.shape]
+        if len(filtered_rooms) == 0:
+            progress_log('Navigation: target lost')
+            return False, None, None
+
+        room_bounds = min(filtered_rooms, key=lambda x: np.linalg.norm(x.pos - room_bounds.pos))
+
         for _ in range(5):
             pre_click_room = no_overlay_grab_screen(room_bounds.get_bbox())
+
             progress_log(f'Clicking: {room_bounds.x, room_bounds.y}')
             mouse_click(room_bounds.x, room_bounds.y)
             sleep(0.5) # click diff wait
@@ -610,12 +640,22 @@ def navigate_to_room(room_bounds, click=True):
 
             progress_log(f'Post-click pixel diff: {click_diff*100:0.2f}%')
 
+            diff_mask = np.any(post_click_room != pre_click_room, axis=2)
             log_image(pre_click_room, 'preclick', increment_counter=False)
             log_image(post_click_room, 'postclick', increment_counter=False)
-            log_image(np.any(post_click_room != pre_click_room, axis=2), 'clickdiff')
+            log_image(diff_mask, 'clickdiff')
+
+            if True:
+                temp_test_rooms = detect_rooms(pre_click_room, return_fragments=True)
+                if len(temp_test_rooms) != 1 or not is_rectangular(temp_test_rooms[0]):
+                    progress_log('ALERT: room_focus assertion failed')
+                    log_image(pre_click_room, 'assertion-failed', increment_counter=False)
 
             # room click diff threshold
-            if click_diff >= 0.01: return True, room_bounds, pre_click_room
+            if click_diff >= 0.01: 
+                if is_room_click(diff_mask):
+                    return True, room_bounds, pre_click_room
+                progress_log(':: Click diff detected, flagged as false positive')
             progress_log(f'Click failed, repeat:')
         
         progress_log('Gave up on clicking...')
@@ -667,8 +707,17 @@ def make_critical_strike(crit_bounds):
         return
 
     mean_hit_times = [np.mean(x) for x in hit_times]
-    avg_diff = np.mean(np.diff(mean_hit_times))
+    diffs = np.diff(mean_hit_times)
+    avg_diff = np.mean(diffs)
+    std_diff = np.std(diffs)
     next_crit = mean_hit_times[-1]
+    crit_offset = avg_diff
+
+    # if std_diff > 0.04:
+    #     progress_log('Warning: diffs deviation is too high, stripping data')
+    #     crit_offset = np.min(diffs)
+
+    crit_offset = np.min(diffs) # experimental approach
 
     for _ in range(10): # limit iteration count to 10
         if next_crit > perf_counter(): break
@@ -680,9 +729,10 @@ def make_critical_strike(crit_bounds):
     sleep(0.1)
     mouse_input.release(mouse.Button.left)
 
-    progress_log(f'Crit diff info gathered: {[f"{x:0.2f}" for x in np.diff(mean_hit_times)]}, avg: {avg_diff:0.2f}s')
+    progress_log(f'Crit diff info gathered: {[f"{x:0.2f}" for x in diffs]}, avg: {avg_diff:0.2f}s, std: {std_diff:0.4f}')
 
     for img in debug_grabs: debug_log_image(img, 'crit-scan')
+    sleep(1.2) # wait for crit message to disappear
 
 def battle_iteration():
     meds, do = detect_med_buttons(screen_img)
@@ -698,6 +748,8 @@ def battle_iteration():
         sleep(0.3)
         make_critical_strike(bounds)
         sleep(0.8)
+
+    return len(meds) > 0, len(crits) > 0
 
 def same_rooms(rooms1, rooms2):
     if rooms1 is None and rooms2 is None: return True
@@ -721,6 +773,7 @@ def zoom_out():
     new_screen = no_overlay_grab_screen()
     if np.sum(new_screen != init_screen) / np.prod(new_screen.shape) > 0.5:
         sleep(0.5) # zoom delay
+        progress_log('Zoomout: full delay')
 
 def has_new_room(rooms, last_rooms):
     if len(rooms) == 0: return False
@@ -741,6 +794,61 @@ def has_new_room(rooms, last_rooms):
 
     return not np.all(matches)
 
+def look_for_room_using_structural():
+    zoom_out()
+    reached_left, reached_right = False, False
+    direction = 'down' # camera actually goes up
+
+    def scan_primary(directions):
+        nonlocal reached_left, reached_right
+        if direction in directions: 
+            pan_camera(direction, camera_pan_initial_duration)
+            reached_left = False
+            reached_right = False
+            return True
+        
+        return False
+
+    def scan_secondary():
+        if not reached_left:
+            pan_camera('left', camera_pan_initial_duration)
+            return True
+        if not reached_right:
+            pan_camera('right', camera_pan_initial_duration)
+            return True
+        
+        return False
+
+    while True:
+        progress_log('Structural room scanning iteration...')
+        no_overlay_grab_screen()
+        rooms, do = detect_rooms(screen_img)
+        if len(rooms) > 0: 
+            progress_log(f'Structural scan found room: {rooms[0][2]}')
+            return True
+        
+        structural, directions, do = detect_structural(screen_img)
+        progress_log(f'Obscured directions: {directions}')
+        reached_left = reached_left or 'left' not in directions
+        reached_right = reached_right or 'right' not in directions
+
+        if direction == 'down': # we want reach `top` as soon as possible
+            if scan_primary(directions) or scan_secondary(): continue
+        else: # on the way to the `bottom` we want scan everything
+            if scan_secondary() or scan_primary(directions): continue
+        
+        # we reached all: direction, left and right!
+        if direction == 'down' and 'up' in directions:
+            progress_log('Top-way scan finished, starting reverse scan...')
+            direction = 'up'
+            continue
+        else:
+            progress_log('Scan finished, noting found :(')
+            return False
+
+def count_structural_holes(structural):
+    return 0
+
 def mission_script():
     global script_running, current_execution_target, mission_ctl
 
@@ -751,8 +859,18 @@ def mission_script():
     current_execution_target = None
 
     last_rooms = None
+    last_time_room_detected = perf_counter()
+    last_iteration_room_detected = True
     while True:
         progress_log('General mission iteration...')
+
+        if perf_counter() - last_time_room_detected >= structural_scan_begin_timeout and not last_iteration_room_detected:
+            progress_log('General iteration timeout, engaging structure-based scanning...')
+            if not look_for_room_using_structural():
+                progress_log('Failed to detect new rooms, aborting execution')
+                break
+
+        last_iteration_room_detected = False
 
         # new 
         in_battle = False
@@ -765,11 +883,12 @@ def mission_script():
 
         rooms, do = detect_rooms(screen_img)
 
-        if len(rooms) == 0: 
+        if len(rooms) == 0:
             progress_log('No rooms detecting, skipping iteration...')
             continue
 
-        # if same_rooms(last_rooms, rooms) or len(rooms) == 0: continue
+        last_time_room_detected = perf_counter()
+        last_iteration_room_detected = True
 
         progress_log(f'Found room: {rooms[0][2]}, type: {rooms[0][0]}')
         navigate_succesfull, room_bounds, pre_click_img = navigate_to_room(rooms[0][2])
@@ -778,7 +897,6 @@ def mission_script():
         last_rooms, _ = detect_rooms(no_overlay_grab_screen())
 
         # wait until the room is reached
-        wait_interval = 0.5 # otherwise it's too fast ?
         while True:
             start_time = perf_counter()
             current_room = no_overlay_grab_screen(room_bounds.get_bbox())
@@ -787,15 +905,15 @@ def mission_script():
             progress_log(f'Waiting for walk completion: current diff {100*diff:0.2f}%')
 
             # min room entered diff threshold
-            if diff >= 0.8: break # room reached!
+            if diff >= room_reached_min_diff: break # room reached!
             elapsed = perf_counter() - start_time
-            if elapsed < wait_interval: sleep(wait_interval - elapsed)
+            if elapsed < walk_wait_min_interval: sleep(walk_wait_min_interval - elapsed)
 
         # we reached room - wait until enemies are detected OR a new room is detected OR 4 seconds pass
         progress_log(f'Walk complete! Analyzing situation...')
-        wait_timeout = 5
         start_time = perf_counter()
-        while perf_counter() - start_time <= wait_timeout:
+        # pre_structural = detect_structural(screen_img)
+        while perf_counter() - start_time <= room_analysis_timeout:
             no_overlay_grab_screen()
             debug_log_image(screen_img, f'wait-iteration')
             have_enemies, _, _ = detect_enemies(screen_img)
@@ -817,7 +935,9 @@ def mission_script():
         while have_enemies:
             no_overlay_grab_screen() # grab screen for this iteration
             debug_log_image(screen_img, 'battle-iteration-capture')
-            battle_iteration() # take care of meds / crits
+            had_meds, had_crits = battle_iteration() # take care of meds / crits
+            if had_crits: continue # critical hit marker can obscure enemies and they go undetected
+
             have_enemies, enemies, _ = detect_enemies(screen_img)
             progress_log(f'Battle iteration: {len(enemies)} enemies detected')
         
