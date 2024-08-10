@@ -42,3 +42,18 @@ room_analysis_timeout = 5
 
 # Room scanning
 structural_scan_begin_timeout = 3
+
+# Structural room detection
+struct_min_room_pixels = 400
+struct_min_room_border_fraction = 0.3
+struct_min_room_clearance_fraction = 0.65
+
+# Structural room matching
+struct_room_match_tolerance = 0.05
+
+# Dialogue detection
+primary_dialogue_button_color = np.array([5, 90, 7])
+dialogue_button_color_max_deviation = 8
+min_dialogue_button_rel_size = np.array([0.4, 0.05])
+min_dialogue_button_border_fraction = 0.9
+dialogue_button_max_center_deviation_rel = 0.05

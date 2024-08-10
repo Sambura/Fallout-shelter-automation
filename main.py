@@ -13,13 +13,14 @@ from time import sleep, perf_counter
 import traceback
 import os
 import datetime
+from random import randrange
 
 def get_room_type(room, loc):
     if loc != 'full': return 'unknown'
     return 'elevator' if room.width < room.height else 'room'
 
-def get_deviation(img, color):
-    return np.sum(np.abs(img - color), axis=2)
+def detect_colored_pixels_fuzzy(pixels, color, max_deviation):
+    return np.sum(np.abs(pixels - color), axis=2) <= max_deviation
 
 # Returns mask that matches all the pixels that match any color from primary to secondary (RGB blending)
 # max_blending controls actual value of secondary_color: = primary_color * (1 - max_blending) + secondary_color * max_blending
@@ -44,6 +45,14 @@ def detect_blending_pixels(pixels, primary_color, secondary_color, max_blending=
     close_pixels = np.logical_or(close_pixels_1, close_pixels_2)
 
     return np.logical_or(masked_results, close_pixels) # restore cut off pixels close to endpoints 
+
+def draw_border(pixels: np.ndarray, bounds: Bounds, color: np.ndarray, thickness=1):
+    border = np.ones((*bounds.shape, pixels.shape[2]), dtype=pixels.dtype) * color
+    h_thickness = min(thickness, (bounds.width - thickness) // 2)
+    v_thickness = min(thickness, (bounds.height - thickness) // 2)
+    border[v_thickness:-v_thickness, h_thickness:-h_thickness] = 0
+
+    pixels[bounds.to_slice()] += border
 
 # (room_type, location, bounds)
 @print_durations()
@@ -308,6 +317,86 @@ def detect_enemies(pixels):
 
     return len(detected) > 0, detected, debug_output
 
+# ended up not using this :( 
+# primary problem is that sometimes some text appears above characters
+# and messes up with structural detection
+@print_durations()
+def detect_structural_rooms(structural: Fragment):
+    structural.compute(patch_mask=True)
+    # patch_mask is true everywhere where there is structural 
+    structure = structural.patch_mask
+
+    debug_output = np.zeros((*screen_shape[:2], 4), dtype=int)
+    mask = np.zeros(structure.shape, dtype=int)
+
+    hole_pixels = np.logical_not(structure)
+    fragments_mask = np.copy(hole_pixels)
+    ys, xs = np.where(fragments_mask)
+
+    fragments_mask = fragment_mask_prepare(fragments_mask)
+
+    fragment_index = 1
+    rooms = []
+    for x, y in zip(xs, ys):
+        if mask[y, x] > 0: continue
+        fragment = detect_fragment(structure, x, y, mask, fragment_index, fragments_mask)
+        fragment_index += 1
+
+        if fragment.bounds.area < struct_min_room_pixels: continue
+        # these just remove some of the edge cases to reduce number of false positive room detections
+        if fragment.bounds.x_min == 0 and structural.bounds.x_min != 0: continue
+        if fragment.bounds.y_min == 0 and structural.bounds.y_min != 0: continue
+        if fragment.bounds.x_max == structural.bounds.width - 1 and structural.bounds.x_max != screen_shape[1] - 1: continue
+        if fragment.bounds.y_max == structural.bounds.height - 1 and structural.bounds.y_max != screen_shape[0] - 1: continue
+
+        clearance_fraction = np.sum(hole_pixels[fragment.bounds.to_slice()]) / fragment.bounds.area
+        if clearance_fraction < struct_min_room_clearance_fraction: continue
+        _, rect_fraction = is_rectangular(fragment, report_fraction=True)
+        if rect_fraction < struct_min_room_border_fraction: continue
+
+        rooms.append(fragment.bounds.offset(structural.bounds.low_pos))
+        
+        # progress_log(f'Detected structural room ({fragment.bounds}) : border fraction {rect_fraction*100:0.2f}%, clearance: {clearance_fraction*100:0.2f}%')
+        if debug_show_progress_visuals:
+            debug_output[rooms[-1].to_slice()] = get_debug_color(fragment_index)
+
+    return rooms, debug_output
+
+@print_durations()
+def detect_dialogue_buttons(pixels):
+    debug_output = np.zeros((*pixels.shape[:2], 4), dtype=int)
+    mask = np.zeros(pixels.shape[:2], dtype=int)
+
+    fragments_mask = detect_colored_pixels_fuzzy(pixels, primary_dialogue_button_color, dialogue_button_color_max_deviation)
+    ys, xs = np.where(fragments_mask)
+
+    fragments_mask = fragment_mask_prepare(fragments_mask)
+
+    fragment_index = 1
+    detected = []
+    for x, y in zip(xs, ys):
+        if mask[y, x] > 0: continue
+        fragment = detect_fragment(pixels, x, y, mask, fragment_index, fragments_mask)
+        fragment_index += 1
+
+        rel_width, rel_height = fragment.bounds.width / screen_shape_xy[0], fragment.bounds.height / screen_shape_xy[1]
+        if rel_width < min_dialogue_button_rel_size[0] or rel_height < min_dialogue_button_rel_size[1]: continue
+        rel_x = fragment.bounds.x / screen_shape_xy[0]
+        if abs(rel_x - 0.5) > dialogue_button_max_center_deviation_rel: continue
+        _, rect_fraction = is_rectangular(fragment, report_fraction=True)
+        if rect_fraction < min_dialogue_button_border_fraction: continue
+
+        # progress_log(f'Detected dialogue button: {fragment.bounds}')
+        if debug_show_progress_visuals:
+            draw_border(debug_output, fragment.bounds, np.array([200, 25, 10, 255], dtype=np.uint8), 4)
+
+        detected.append(fragment)
+
+    # just in case
+    detected = sorted(detected, key=lambda x: x.bounds.y)
+
+    return len(detected) > 0, detected, debug_output
+
 ###
 ### ======================== MAIN ========================
 ### 
@@ -318,6 +407,7 @@ update_interval = 20
 camera_pan_deadzone = 0.1
 camera_pan_initial_duration = 0.1
 crit_wait_count = 4
+dialogue_mode = 'manual' # random / manual
 
 task_in_progress = False
 shortcut_chord_pending = False
@@ -326,6 +416,7 @@ script_running = False
 current_execution_target = None
 mission_ctl = False
 show_log = True
+last_key_pressed = None
 
 def update_overlay(param): pass
 
@@ -407,6 +498,10 @@ def chord_handler(key):
             current_execution_target = start_detect_structural
         elif key.char == 'e':
             current_execution_target = start_detect_enemies
+        elif key.char == 'h':
+            current_execution_target = start_detect_structural_rooms
+        elif key.char == 'n':
+            current_execution_target = start_detect_dialogue_buttons
         else: progress_log('Unknown chord...')
 
 root = tk.Tk()
@@ -415,7 +510,8 @@ root.attributes('-transparentcolor','#f0f0f0')
 root.attributes("-topmost", True)   
 
 log(
-'''Start mission script: Ctrl + F; Enter (Esc to terminate)
+'''Fallout Shelter Automation: v0.3.1
+Start mission script: Ctrl + F; Enter (Esc to terminate)
 Toggle log display: Ctrl + F; L
 Shutdown: Ctrl + F; Esc
 ''')
@@ -495,12 +591,24 @@ def start_detect_rooms():
 
 def start_detect_structural():
     result_log('Starting structural detection...')
-    fragments, do = detect_structural(no_overlay_grab_screen())
+    fragments, _, do = detect_structural(no_overlay_grab_screen())
+    update_overlay(do)
+
+def start_detect_structural_rooms():
+    result_log('Starting structural room detection...')
+    structural, _, _ = detect_structural(no_overlay_grab_screen())
+    fragments, do = detect_structural_rooms(structural)
+
     update_overlay(do)
 
 def start_detect_enemies():
     result_log('Starting enemies detection...')
     _, fragments, do = detect_enemies(no_overlay_grab_screen())
+    update_overlay(do)
+
+def start_detect_dialogue_buttons():
+    result_log('Starting dialogue button detection...')
+    _, buttons, do = detect_dialogue_buttons(no_overlay_grab_screen())
     update_overlay(do)
 
 diff_image = no_overlay_grab_screen(None)
@@ -553,6 +661,31 @@ def mouse_click(x, y):
     mouse_input.press(mouse.Button.left)
     sleep(0.12)
     mouse_input.release(mouse.Button.left)
+
+def dialogue_random_handler(buttons):
+    button_index = randrange(len(buttons))
+
+    mouse_click(*buttons[button_index].bounds.pos)
+    progress_log(f'Clicking button #{button_index + 1}...')
+
+def dialogue_manual_handler(buttons):
+    global last_key_pressed
+    progress_log(f'Waiting input: 1-{len(buttons)}...')
+
+    # technically it is *kindof* a race condition, but we don't care right?
+    last_key_pressed = None
+    while last_key_pressed is None or not hasattr(last_key_pressed, 'char') or not ('1' <= last_key_pressed.char <= '9'):
+        sleep(0.1)
+
+    button_index = int(last_key_pressed.char) - 1
+
+    progress_log(f'Clicking button #{button_index + 1}...')
+    mouse_click(*buttons[button_index].bounds.pos)
+    
+dialogue_handlers = {
+    'random': dialogue_random_handler,
+    'manual': dialogue_manual_handler
+}
 
 def log_image(img, postfix, increment_counter=True):
     global output_index
@@ -846,8 +979,18 @@ def look_for_room_using_structural():
             progress_log('Scan finished, noting found :(')
             return False
 
-def count_structural_holes(structural):
-    return 0
+def match_room_with_structural(structural_rooms, room_bounds):
+    for room in structural_rooms:
+        if abs(room.x - room_bounds.x) > struct_room_match_tolerance * room_bounds.width: continue
+        if abs(room.y - room_bounds.y) > struct_room_match_tolerance * room_bounds.height: continue
+        if abs(room.width - room_bounds.width) > struct_room_match_tolerance * room_bounds.width: continue
+        if abs(room.height - room_bounds.height) > struct_room_match_tolerance * room_bounds.height: continue
+
+        progress_log(f'Matched structural room: {room_bounds}')
+        progress_log(f'Matching room: {room}')
+        return True
+
+    return False
 
 def mission_script():
     global script_running, current_execution_target, mission_ctl
@@ -875,6 +1018,7 @@ def mission_script():
         # new 
         in_battle = False
         new_room_discovered = False
+        in_dialogue = False
         
         zoom_out() # general iteration on max zoom out for simplicity
         no_overlay_grab_screen() # grab screen for this iteration
@@ -891,8 +1035,8 @@ def mission_script():
         last_iteration_room_detected = True
 
         progress_log(f'Found room: {rooms[0][2]}, type: {rooms[0][0]}')
-        navigate_succesfull, room_bounds, pre_click_img = navigate_to_room(rooms[0][2])
-        if not navigate_succesfull: continue
+        navigate_successful, room_bounds, pre_click_img = navigate_to_room(rooms[0][2])
+        if not navigate_successful: continue
         progress_log(f'Room navigation successful, waiting for walk complete...')
         last_rooms, _ = detect_rooms(no_overlay_grab_screen())
 
@@ -911,36 +1055,87 @@ def mission_script():
 
         # we reached room - wait until enemies are detected OR a new room is detected OR 4 seconds pass
         progress_log(f'Walk complete! Analyzing situation...')
-        start_time = perf_counter()
-        # pre_structural = detect_structural(screen_img)
-        while perf_counter() - start_time <= room_analysis_timeout:
-            no_overlay_grab_screen()
-            debug_log_image(screen_img, f'wait-iteration')
-            have_enemies, _, _ = detect_enemies(screen_img)
-            if have_enemies:
-                in_battle = True
-                progress_log('Enemies detected!')
-                break
+        post_walk_screen_img = no_overlay_grab_screen()
+        debug_log_image(post_walk_screen_img, f'post-walk-structural')
+
+        proceed = False
+        while not proceed:
+            start_time = perf_counter()
+            while perf_counter() - start_time <= room_analysis_timeout:
+                no_overlay_grab_screen()
+                debug_log_image(screen_img, f'wait-iteration')
+                have_enemies, _, _ = detect_enemies(screen_img)
+                have_crits, _ = detect_critical_button(screen_img)
+                if have_enemies or have_crits:
+                    in_battle = True
+                    have_enemies = True
+                    progress_log('Enemies detected!')
+                    proceed = True # enemies, no need to stay
+                    break
+                
+                rooms, _ = detect_rooms(screen_img)
+                if has_new_room(rooms, last_rooms):
+                    new_room_discovered = True
+                    progress_log('New room detected (?), proceeding...')
+                    break
+                
+            new_room_confirmed = new_room_discovered and room_bounds.height == rooms[0][2].height
+            if new_room_confirmed:
+                progress_log('New room confirmed, proceeding...')
+                proceed = True # new room, no need to stay
+            elif not have_enemies:
+                progress_log('Matching structural...')
+                no_overlay_grab_screen()
+                debug_log_image(screen_img, f'structural-room-match')
+                structural, _, _ = detect_structural(post_walk_screen_img)
+                structural_match = np.sum(np.all(screen_img[structural.points[:,0], structural.points[:,1]] == structural_color, axis=1))
+                structural_match /= structural.point_count
+                # structural_rooms, _ = detect_structural_rooms(structural)
+                # in_dialogue = not match_room_with_structural(structural_rooms, room_bounds)
+                in_dialogue = structural_match < 0.6
+                progress_log(f'Structural match: {100*structural_match:0.2f}%')
+                # central_room = next((x for x in structural_rooms if x.contains_point(*screen_center_xy)), None)
+                if in_dialogue: 
+                    progress_log(f'Dialogue detected!')
+                elif not new_room_discovered:
+                    progress_log('Structural matched, nothing to do - aborting iteration')
+                    proceed = True # nothing to do - proceeding
+                    continue
+                else:
+                    proceed = True # unconfirmed, but new room - no need to stay
+
+            while have_enemies:
+                no_overlay_grab_screen() # grab screen for this iteration
+                debug_log_image(screen_img, 'battle-iteration-capture')
+                had_meds, had_crits = battle_iteration() # take care of meds / crits
+                if had_crits: continue # critical hit marker can obscure enemies and they go undetected
+
+                have_enemies, enemies, _ = detect_enemies(screen_img)
+                progress_log(f'Battle iteration: {len(enemies)} enemies detected')
+
+            while in_dialogue:
+                progress_log(f'Dialog: waiting...')
+                zoom_out()
+                no_overlay_grab_screen() # grab screen for this iteration
+                debug_log_image(screen_img, 'dialogue-iteration-capture')
+                dialogue_choice, buttons, _ = detect_dialogue_buttons(screen_img)
+                if dialogue_choice:
+                    progress_log('Dialog choice detected!')
+                    progress_log(f'Starting handler: {dialogue_mode}')
+                    dialogue_handlers[dialogue_mode](buttons)
+                    sleep(0.2)
+                    continue
+
+                # structural, _, _ = detect_structural(screen_img)
+                # structural_rooms, _ = detect_structural_rooms(structural)
+                structural_match = np.sum(np.all(screen_img[structural.points[:,0], structural.points[:,1]] == structural_color, axis=1))
+                structural_match /= structural.point_count
+                progress_log(f'Dialog: match {100*structural_match:0.2f}%')
+                # if not match_room_with_structural(structural_rooms, central_room):
+                if structural_match >= 0.6:
+                    progress_log(f'Dialog over!')
+                    break
             
-            rooms, _ = detect_rooms(screen_img)
-            if has_new_room(rooms, last_rooms):
-                new_room_discovered = True
-                progress_log('New room detected, proceeding...')
-                break
-
-        if not new_room_discovered and not have_enemies:
-            progress_log('Wait timeout, aborting iteration')
-            continue
-
-        while have_enemies:
-            no_overlay_grab_screen() # grab screen for this iteration
-            debug_log_image(screen_img, 'battle-iteration-capture')
-            had_meds, had_crits = battle_iteration() # take care of meds / crits
-            if had_crits: continue # critical hit marker can obscure enemies and they go undetected
-
-            have_enemies, enemies, _ = detect_enemies(screen_img)
-            progress_log(f'Battle iteration: {len(enemies)} enemies detected')
-        
         progress_log('Noting to do, proceeding to next iteration')
         continue
 
@@ -956,6 +1151,9 @@ def run_keyboard_listener():
         return _func
     
     def keyboard_on_press(key):
+        global last_key_pressed
+        last_key_pressed = key
+
         try:
             chord_handler(key) 
         except:
@@ -974,5 +1172,6 @@ with Image.open("./resources/test_overlay.png") as img:
     update_overlay(np.array(img))
 thread = threading.Thread(target=run_keyboard_listener)
 thread.start()
+
 root.after(update_interval, update)
 root.mainloop()

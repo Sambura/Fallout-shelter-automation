@@ -27,6 +27,7 @@ class Bounds:
         self.area = self.width * self.height
         self.shape = (self.height, self.width)
         self.pos = np.array([self.x, self.y])
+        self.low_pos = np.array([self.x_min, self.y_min])
 
     def from_rect(x, y, width, height):
         return Bounds(x, y, x + width - 1, y + height - 1)
@@ -46,10 +47,17 @@ class Bounds:
         if self.y_max < bounds.y_max or bounds.y_min < self.y_min: return False
         return True
 
+    def contains_point(self, x, y):
+        return self.contains_bounds(Bounds(x, y, x, y))
+
     def to_slice(self):
         return (slice(self.y_min, self.y_max + 1), slice(self.x_min, self.x_max + 1))
 
     def get_bbox(self): return [self.x_min, self.y_min, self.x_max, self.y_max]
+
+    def offset(self, offset):
+        x, y = offset
+        return Bounds(self.x_min + x, self.y_min + y, self.x_max + x, self.y_max + y)
 
     def offset_bounds(self, *offsets):
         if len(offsets) == 1:
@@ -85,4 +93,5 @@ def detect_fragment(pixels, x, y, mask, value, matching_mask):
     return Fragment(pixels, mask, value, rect)
 
 def fragment_mask_prepare(mask):
+    """Inverts the given array and pads with 1 pixel from each side. Resulting array is of type uint8"""
     return np.pad(np.logical_not(mask), 1, 'constant', constant_values=True).astype(np.uint8)
