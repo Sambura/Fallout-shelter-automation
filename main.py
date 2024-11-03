@@ -1,8 +1,9 @@
 from src.game_constants import *
-from src.vision import get_debug_color, grab_screen, detect_fragment, fragment_mask_prepare, Bounds, Fragment
+from src.vision import get_debug_color, grab_screen, detect_fragment, fragment_mask_prepare, Bounds, Fragment, detect_fragments, group_fragments
 from src.util import *
 
 import numpy as np
+from scipy.signal import convolve2d
 from PIL import Image
 from funcy import print_durations
 import tkinter as tk
@@ -21,6 +22,13 @@ def get_room_type(room, loc):
 
 def detect_colored_pixels_fuzzy(pixels, color, max_deviation):
     return np.sum(np.abs(pixels - color), axis=2) <= max_deviation
+
+# Use when you need to match pixels that have any color you can get by multiplying
+# a number from 0 to 1 by the `color` (so any color from black up to `color`)
+def match_cont_color(pixels, color, tolerance):
+    color_grads = np.mean(pixels.astype(float) / color, axis=2) 
+    recolor = color_grads.reshape(*color_grads.shape, 1) * color.reshape(1, -1)
+    return np.sum(np.abs(pixels - recolor), axis=2) <= tolerance
 
 # Returns mask that matches all the pixels that match any color from primary to secondary (RGB blending)
 # max_blending controls actual value of secondary_color: = primary_color * (1 - max_blending) + secondary_color * max_blending
@@ -52,7 +60,18 @@ def draw_border(pixels: np.ndarray, bounds: Bounds, color: np.ndarray, thickness
     v_thickness = min(thickness, (bounds.height - thickness) // 2)
     border[v_thickness:-v_thickness, h_thickness:-h_thickness] = 0
 
-    pixels[bounds.to_slice()] += border
+    try:
+        pixels[bounds.to_slice()] += border
+    except:
+        progress_log('draw border failed')
+
+def draw_circle(canvas, pos, radius, color):
+    ts = np.linspace(0, 2 * np.pi, int(1.1 * 2 * radius * np.pi))
+    xs = np.round(np.cos(ts) * radius + pos[0]).astype(int)
+    ys = np.round(np.sin(ts) * radius + pos[1]).astype(int)
+
+    for x, y in zip(xs, ys):
+        canvas[y, x] = color
 
 # (room_type, location, bounds)
 @print_durations()
@@ -233,6 +252,7 @@ def detect_critical_button(pixels):
 
     return detected, debug_output
 
+# [?] Detects the largest fragment that has structural color (black)
 # structural fragment, obscured_directions, debug_output
 @print_durations()
 def detect_structural(pixels):
@@ -317,6 +337,8 @@ def detect_enemies(pixels):
 
     return len(detected) > 0, detected, debug_output
 
+# [?] Accepts a structural fragment (from detect_structural) and returns the list of rooms
+# in this structural (as an array of Bounds)
 # ended up not using this :( 
 # primary problem is that sometimes some text appears above characters
 # and messes up with structural detection
@@ -443,6 +465,14 @@ FSA_overlay_loading = np.ones((*screen_shape, 4), dtype=np.uint8) * np.array([18
 FSA_overlay[1:-1,1:-1] = 0
 FSA_overlay_loading[2:-2,2:-2] = 0
 
+debug_output = np.zeros((*screen_shape[:2], 4), dtype=int)
+def clear_debug_canvas(): 
+    global debug_output
+    debug_output *= 0
+
+def display_debug():
+    update_overlay(debug_output)
+
 sx, sy = screen_center_xy
 sw, sh = (screen_shape_xy * camera_pan_deadzone / 2).astype(int)
 camera_deadzone = Bounds(sx - sw, sy - sh, sx + sw, sy + sh)
@@ -502,6 +532,10 @@ def chord_handler(key):
             current_execution_target = start_detect_structural_rooms
         elif key.char == 'n':
             current_execution_target = start_detect_dialogue_buttons
+        elif key.char == '/':
+            current_execution_target = start_diff_sum
+        elif key.char == 'd':
+            current_execution_target = start_radius_debug
         else: progress_log('Unknown chord...')
 
 root = tk.Tk()
@@ -610,6 +644,21 @@ def start_detect_dialogue_buttons():
     result_log('Starting dialogue button detection...')
     _, buttons, do = detect_dialogue_buttons(no_overlay_grab_screen())
     update_overlay(do)
+
+def start_diff_sum():
+    result_log('Debug diff detection..')
+    clear_debug_canvas()
+    global current_execution_target
+    current_execution_target = None
+    detect_loot()
+    display_debug()
+
+def start_radius_debug():
+    result_log('Radius visualization..')
+    global current_execution_target
+    current_execution_target = None
+    radius_probe_debug()
+    update_overlay(debug_output)
 
 diff_image = no_overlay_grab_screen(None)
 def start_diff_visualize():
@@ -908,6 +957,11 @@ def zoom_out():
         sleep(0.5) # zoom delay
         progress_log('Zoomout: full delay')
 
+def zoom_in(x, y):
+    mouse_input.position = (x, y)
+    for _ in range(5): mouse_input.scroll(0, 1)
+    sleep(1)
+
 def has_new_room(rooms, last_rooms):
     if len(rooms) == 0: return False
     if len(last_rooms) == 0: return True
@@ -992,6 +1046,185 @@ def match_room_with_structural(structural_rooms, room_bounds):
 
     return False
 
+def detect_loot():
+    no_overlay_grab_screen()
+    structural, _, _ = detect_structural(screen_img)
+    rooms, _ = detect_structural_rooms(structural)
+    central_room = next((x for x in rooms if x.contains_point(*screen_center_xy)), None)
+    if central_room is None:
+        progress_log(f'!Critical: failed to detect central room! Fallback to whole screen')
+        central_room = Bounds(0, 0, screen_shape_xy[0] - 1, screen_shape_xy[1] - 1)
+    else:
+        progress_log(f'Detected main room for loot collection: {central_room}')
+
+
+        central_room = Bounds(0, 0, screen_shape_xy[0] - 1, screen_shape_xy[1] - 1)
+        
+    search_iterations = 24
+    fps = 8
+    progress_log(f'Loot collection start: {search_iterations} frames at {fps} FPS')
+    
+    # collect frame data
+    frames = []
+    for x in range(search_iterations):
+        start_time = perf_counter()
+        frames.append(no_overlay_grab_screen(rect=central_room.get_bbox()))
+        sleep(max(0, 1 / fps - (perf_counter() - start_time)))
+
+    progress_log(f'Frames collected, analyzing...')
+    debug_log_image(frames[0], f'loot-frame-0')
+    
+    masks = [ detect_blending_pixels(x, general_loot_particle_primary_color, 
+        general_loot_particle_secondary_color, max_deviation=general_loot_particle_colors_deviation) for x in frames ]
+
+    progress_log(f'Frames processed')
+
+    # starting corspse detection
+    color_diffs = [np.abs(x.astype(int) - y).astype(np.uint8) for x, y in zip(frames[:-1], frames[1:])]
+
+    matches = [match_cont_color(x, corpse_particles_base_color, corpse_color_detection_threshold) for x in color_diffs]
+    for x, y in zip(matches, color_diffs): x[np.all(y == 0, axis=2)] = 0
+    cum_match = np.sum(matches, axis=0) > 0
+
+    progress_log(f'Matches calculated')
+
+    kernel_size = 11
+    threshold = 0.75
+    smoothed = convolve2d(cum_match.astype(int), np.ones((kernel_size, kernel_size)), mode='same')
+    filtered_mask = smoothed > kernel_size * kernel_size * threshold
+
+    fragments_c, _, _, f_mask = detect_fragments(filtered_mask, filtered_mask, corpse_min_fragment_pixels)
+
+    # corpse detection over
+
+    m_diffs = [x != y for x, y in zip(masks[:-1], masks[1:])]
+    diffs = [np.any(x != y, axis=2) for x, y in zip(frames[:-1], frames[1:])]
+    diff_sum = np.sum(m_diffs, axis=0) > 0
+    
+    progress_log(f'Got initial diff mask, making second pass...')
+
+    cum_diffs = np.sum([x * diff_sum > 0 for x in diffs], axis=0)
+    cum_diffs = cum_diffs.astype(float) / np.max(cum_diffs)
+
+    loot_threshold = 0.25
+    loot_candidates_mask = np.logical_and(cum_diffs <= loot_threshold, cum_diffs > 0)
+
+    fragments, _, _, _ = detect_fragments(loot_candidates_mask, loot_candidates_mask)
+    groups = group_fragments(fragments, general_loot_particle_search_radius)
+    group_bounds = [Bounds.from_points(*[y for x in group for y in x.bounds.get_corners()]) for group in groups]
+
+    progress_log(f'Finished grouping candidate fragments, groups: {len(groups)}')
+
+    filtered_groups = []
+
+    for i, group in enumerate(groups):
+        if group_bounds[i].width < loot_min_size or group_bounds[i].height < loot_min_size:
+            progress_log(f'Discarding too small group: {group_bounds[i]}')
+            continue
+        else:
+            filtered_groups.append(group_bounds[i].offset(central_room.low_pos))
+        
+        # for fragment in group:
+        #     debug_output[fragment.bounds.to_slice(offset=central_room.low_pos)] = get_debug_color(i)
+
+        draw_border(debug_output, group_bounds[i].offset(central_room.low_pos), get_debug_color(i), 2)
+
+    for fragment in fragments_c:
+        if fragment.bounds.width < corpse_min_fragment_size or fragment.bounds.height < corpse_min_fragment_size:
+            progress_log(f'Discarding corpse candidate: {fragment.bounds}')
+            continue
+        else:
+            filtered_groups.append(fragment.bounds.offset(central_room.low_pos))
+
+        draw_border(debug_output, fragment.bounds.offset(central_room.low_pos), get_debug_color(randrange(100)), 4)
+
+    return filtered_groups
+
+def detect_loot2():
+    no_overlay_grab_screen()
+    structural, _, _ = detect_structural(screen_img)
+    rooms, _ = detect_structural_rooms(structural)
+    central_room = next((x for x in rooms if x.contains_point(*screen_center_xy)), None)
+    if central_room is None:
+        progress_log(f'!Critical: failed to detect central room! Fallback to whole screen')
+        central_room = Bounds(0, 0, screen_shape_xy[0] - 1, screen_center_xy[1] - 1)
+    else:
+        progress_log(f'Detected main room for loot collection: {central_room}')
+        
+    search_iterations = 24
+    fps = 8
+    progress_log(f'Loot collection start: {search_iterations} frames at {fps} FPS')
+
+
+    central_room = Bounds(0, 0, screen_shape_xy[0] - 1, screen_center_xy[1] - 1)
+    # collect frame data
+    frames = []
+    for x in range(search_iterations):
+        start_time = perf_counter()
+        frames.append(no_overlay_grab_screen())
+        sleep(max(0, 1 / fps - (perf_counter() - start_time)))
+
+    progress_log(f'Frames collected, analyzing...')
+
+    color_diffs = [np.abs(x.astype(int) - y).astype(np.uint8) for x, y in zip(frames[:-1], frames[1:])]
+
+    matches = [match_cont_color(x, corpse_particles_base_color, corpse_color_detection_threshold) for x in color_diffs]
+    for x, y in zip(matches, color_diffs): x[np.all(y == 0, axis=2)] = 0
+    cum_match = np.sum(matches, axis=0) > 0
+
+    progress_log(f'Matches calculated')
+
+    # debug_output[cum_match] = np.array([0, 0, 255, 255])
+
+    kernel_size = 11
+    threshold = 0.75
+    smoothed = convolve2d(cum_match.astype(int), np.ones((kernel_size, kernel_size)), mode='same')
+    filtered_mask = smoothed > kernel_size * kernel_size * threshold
+
+    # debug_output[filtered_mask] += np.array([255, 0, 0, 255])
+    # debug_output[:,:,3] = 255
+
+    fragments, _, _, f_mask = detect_fragments(filtered_mask, filtered_mask, corpse_min_fragment_pixels)
+
+    for fragment in fragments:
+        debug_output[f_mask == fragment.fragment_value] = get_debug_color(fragment.fragment_value)
+
+    return
+
+def radius_probe_debug():
+    clear_debug_canvas()
+    no_overlay_grab_screen()
+    radius = 40
+
+    fragments_mask = np.all(screen_img == np.array([0, 255, 0]), axis=2)
+    fragments, _, _ = detect_fragments(screen_img, fragments_mask, patch_mask=True)
+
+    # for fragment in fragments:
+    #     draw_circle(debug_output, fragment.bounds.pos, radius, np.array([255,255,255,255]))
+    
+    if len(fragments) == 0: return
+    start_fragment = fragments[randrange(len(fragments))]
+    # debug_output[start_fragment.bounds.to_slice()][start_fragment.patch_mask] = np.array([255, 0, 0, 255])
+    draw_circle(debug_output, start_fragment.bounds.pos, radius, np.array([255,0,0,255]))
+    connected_fragments = [start_fragment]
+    connect = True
+
+    while connect:
+        connect = False
+        for fragment in fragments:
+            if fragment in connected_fragments: continue
+
+            break_flag = False
+            for base_frag in connected_fragments:
+                for corner in fragment.bounds.get_corners():
+                    if np.linalg.norm(np.array(corner) - base_frag.bounds.pos) <= radius:
+                        connect = True
+                        connected_fragments.append(fragment)
+                        draw_circle(debug_output, fragment.bounds.pos, radius, np.array([0,255,0,255]))
+                        break_flag = True
+                        break
+                if break_flag: break
+        
 def mission_script():
     global script_running, current_execution_target, mission_ctl
 
@@ -1104,6 +1337,9 @@ def mission_script():
                 else:
                     proceed = True # unconfirmed, but new room - no need to stay
 
+            if not in_dialogue: # if not in dialogue, we are still not zoomed in
+                zoom_in(*room_bounds.pos)
+
             while have_enemies:
                 no_overlay_grab_screen() # grab screen for this iteration
                 debug_log_image(screen_img, 'battle-iteration-capture')
@@ -1135,7 +1371,14 @@ def mission_script():
                 if structural_match >= 0.6:
                     progress_log(f'Dialog over!')
                     break
-            
+        
+        progress_log(f'Proceeding to loot collection!')
+        loot_bounds = detect_loot()
+        progress_log(f'Detected {len(loot_bounds)} loots')
+        for loot in loot_bounds:
+            mouse_click(*loot.pos)
+            sleep(0.4)
+
         progress_log('Noting to do, proceeding to next iteration')
         continue
 

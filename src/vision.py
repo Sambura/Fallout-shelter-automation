@@ -3,6 +3,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import cv2
 
+# local terms:
+#       bounds: instance of Bounds class
+#       bbox: array/tuple of numbers [x0, y0, x1, y1]
+#       rect: array/tuple of numbers [x0, y0, width, height]
+
 def grab_real_screen(rect):
     if rect is not None: rect = [rect[0], rect[1], rect[2] + 1, rect[3] + 1]
     return np.array(ImageGrab.grab(rect))
@@ -32,10 +37,21 @@ class Bounds:
     def from_rect(x, y, width, height):
         return Bounds(x, y, x + width - 1, y + height - 1)
 
+    def get_corners(self):
+        return [(self.x_min, self.y_min), (self.x_min, self.y_max), (self.x_max, self.y_min), (self.x_max, self.y_max)]
+
+    def to_rect(self):
+        return [self.x_min, self.y_min, self.width, self.height]
+
     def from_center(x, y, width, height):
         x_min = x - width // 2
         y_min = y - height // 2
         return Bounds.from_rect(x_min, y_min, width, height)
+
+    def from_points(*points):
+        np_points = np.array(points)
+        xs, ys = np_points[:,0], np_points[:,1]
+        return Bounds(np.min(xs), np.min(ys), np.max(xs), np.max(ys))
 
     def get_scaled_from_center(self, scale):
         half_width = int(scale * self.width / 2)
@@ -50,8 +66,10 @@ class Bounds:
     def contains_point(self, x, y):
         return self.contains_bounds(Bounds(x, y, x, y))
 
-    def to_slice(self):
-        return (slice(self.y_min, self.y_max + 1), slice(self.x_min, self.x_max + 1))
+    def to_slice(self, offset=None):
+        if offset is None: offset = [0, 0]
+        ox, oy = offset
+        return (slice(self.y_min + oy, self.y_max + 1 + oy), slice(self.x_min + ox, self.x_max + 1 + ox))
 
     def get_bbox(self): return [self.x_min, self.y_min, self.x_max, self.y_max]
 
@@ -95,3 +113,49 @@ def detect_fragment(pixels, x, y, mask, value, matching_mask):
 def fragment_mask_prepare(mask):
     """Inverts the given array and pads with 1 pixel from each side. Resulting array is of type uint8"""
     return np.pad(np.logical_not(mask), 1, 'constant', constant_values=True).astype(np.uint8)
+
+def detect_fragments(pixels, fragments_mask, min_pixel_count=0, **compute_kwargs):
+    "returns list of found fragments, list of x and list of y coordinates derived from fragment_mask"
+    mask = np.zeros(pixels.shape[:2], dtype=int)
+    ys, xs = np.where(fragments_mask)
+    fragments_mask = fragment_mask_prepare(fragments_mask)
+
+    fragment_index = 1
+    fragments = []
+    for x, y in zip(xs, ys):
+        if mask[y, x] > 0: continue
+        fragment = detect_fragment(pixels, x, y, mask, fragment_index, fragments_mask)
+        fragment_index += 1
+        if fragment.point_count < min_pixel_count: continue
+        fragments.append(fragment)
+        if len(compute_kwargs) > 0: fragment.compute(**compute_kwargs)
+    
+    return fragments, xs, ys, mask
+
+# returns list of lists of fragments (list of groups)
+def group_fragments(fragments, radius):
+    if len(fragments) == 0: return []
+    free_fragments : list = fragments[:]
+    groups = []
+
+    while len(free_fragments) > 0:
+        current_group = [free_fragments[0]]
+        checked_fragments = [False]
+        free_fragments.remove(free_fragments[0])
+
+        while not checked_fragments[-1]:
+            for i, (group_fragment, is_checked) in enumerate(zip(current_group, checked_fragments)):
+                if is_checked: continue
+                
+                for fragment in free_fragments[:]: # copy list
+                    for corner in fragment.bounds.get_corners():
+                        if np.linalg.norm(np.array(corner) - group_fragment.bounds.pos) > radius: continue
+                        current_group.append(fragment)
+                        checked_fragments.append(False)
+                        free_fragments.remove(fragment)
+                        break
+
+                checked_fragments[i] = True
+        groups.append(current_group)
+
+    return groups
