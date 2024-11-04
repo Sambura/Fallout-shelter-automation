@@ -4,5 +4,6 @@
         "postclick",
         "preclick",
         "rescan"
-    ]
+    ],
+    "cSpell.enabled": false
 }

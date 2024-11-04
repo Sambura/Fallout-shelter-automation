@@ -8,9 +8,9 @@ import cv2
 #       bbox: array/tuple of numbers [x0, y0, x1, y1]
 #       rect: array/tuple of numbers [x0, y0, width, height]
 
-def grab_real_screen(rect):
-    if rect is not None: rect = [rect[0], rect[1], rect[2] + 1, rect[3] + 1]
-    return np.array(ImageGrab.grab(rect))
+def grab_real_screen(bbox):
+    if bbox is not None: bbox = [bbox[0], bbox[1], bbox[2] + 1, bbox[3] + 1]
+    return np.array(ImageGrab.grab(bbox))
 
 grab_screen = grab_real_screen
 
@@ -47,6 +47,11 @@ class Bounds:
         x_min = x - width // 2
         y_min = y - height // 2
         return Bounds.from_rect(x_min, y_min, width, height)
+
+    def are_smaller_than(self, width, height=None):
+        "specify one argument to compare to a square"
+        if height is None: height = width
+        return self.width < width or self.height < height
 
     def from_points(*points):
         np_points = np.array(points)
@@ -114,7 +119,7 @@ def fragment_mask_prepare(mask):
     """Inverts the given array and pads with 1 pixel from each side. Resulting array is of type uint8"""
     return np.pad(np.logical_not(mask), 1, 'constant', constant_values=True).astype(np.uint8)
 
-def detect_fragments(pixels, fragments_mask, min_pixel_count=0, **compute_kwargs):
+def detect_fragments(pixels, fragments_mask, **compute_kwargs):
     "returns list of found fragments, list of x and list of y coordinates derived from fragment_mask"
     mask = np.zeros(pixels.shape[:2], dtype=int)
     ys, xs = np.where(fragments_mask)
@@ -126,7 +131,6 @@ def detect_fragments(pixels, fragments_mask, min_pixel_count=0, **compute_kwargs
         if mask[y, x] > 0: continue
         fragment = detect_fragment(pixels, x, y, mask, fragment_index, fragments_mask)
         fragment_index += 1
-        if fragment.point_count < min_pixel_count: continue
         fragments.append(fragment)
         if len(compute_kwargs) > 0: fragment.compute(**compute_kwargs)
     
@@ -159,3 +163,66 @@ def group_fragments(fragments, radius):
         groups.append(current_group)
 
     return groups
+
+def match_color_exact(pixels, color):
+    "Simple matcher, matches only pixels that are exactly `color`"
+    return np.all(pixels == color, axis=2)
+
+def match_color_fuzzy(pixels, color, max_deviation):
+    "Simple fuzzy matcher, matches any pixels that are up to `max_deviation` far from `color`"
+    return np.sum(np.abs(pixels - color), axis=2) <= max_deviation
+
+def match_cont_color(pixels, color, tolerance):
+    """
+    Use when you need to match pixels that have any color you can get by multiplying
+    a number from 0 to 1 by the `color` (so any color from black up to `color`)
+    """
+    color_grads = np.mean(pixels.astype(float) / color, axis=2) 
+    recolor = color_grads.reshape(*color_grads.shape, 1) * color.reshape(1, -1)
+    return np.sum(np.abs(pixels - recolor), axis=2) <= tolerance
+
+def detect_blending_pixels(pixels, primary_color, secondary_color, max_blending=1, max_deviation=0):
+    """
+    Returns mask that matches all the pixels that match any color from primary to secondary (RGB blending)
+    max_blending controls actual value of secondary_color: = primary_color * (1 - max_blending) + secondary_color * max_blending
+    max_deviation lets match pixels that do not match exactly with the blend
+    """
+    max_blended_color = np.clip(np.round(primary_color * (1 - max_blending) + secondary_color * max_blending), 0, 255)
+
+    color_direction = max_blended_color - primary_color
+    pixel_directions = pixels - primary_color
+    pixel_directions_sec = pixels - max_blended_color
+    distances = np.linalg.norm(np.cross(pixel_directions, color_direction), axis=2) / np.linalg.norm(color_direction)
+    raw_results = distances <= max_deviation # without endpoint checking
+
+    directions_primary = np.dot(pixel_directions, color_direction)
+    directions_secondary = np.dot(pixel_directions_sec, -color_direction)
+    endpoint_mask = np.logical_and(directions_primary >= 0, directions_secondary >= 0)
+
+    masked_results = np.logical_and(raw_results, endpoint_mask) # everything past endpoints cut off
+
+    close_pixels_1 = np.linalg.norm(pixel_directions, axis=2) <= max_deviation
+    close_pixels_2 = np.linalg.norm(pixel_directions_sec, axis=2) <= max_deviation
+    close_pixels = np.logical_or(close_pixels_1, close_pixels_2)
+
+    return np.logical_or(masked_results, close_pixels) # restore cut off pixels close to endpoints 
+
+def is_fragment_rectangular(fragment: Fragment, report_fraction=False):
+    if not hasattr(fragment, 'patch_mask'): fragment.compute(patch_mask=True)
+
+    rect_mask = np.ones(fragment.bounds.shape, dtype=bool)
+    rect_mask[1:-1, 1:-1] = False
+
+    # same as np.sum(rect_mask)
+    mask_ones_count = 2 * (rect_mask.shape[0] + rect_mask.shape[1] - 2)
+    mask_ones_count2 = np.sum(rect_mask)
+    if mask_ones_count != mask_ones_count2: raise 'wtf'
+    matching_pixels = np.sum(np.logical_and(fragment.patch_mask, rect_mask))
+    matching_fraction = matching_pixels / mask_ones_count
+ 
+    if report_fraction: return matching_fraction == 1, matching_fraction
+    return matching_fraction == 1
+
+def compute_img_diff_ratio(img1, img2):
+    "computes fraction of differing pixels between two images"
+    return np.sum(np.any(img1 != img2, axis=2)) / np.prod(img1.shape[:2])

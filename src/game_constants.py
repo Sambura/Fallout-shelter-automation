@@ -63,7 +63,7 @@ general_loot_particle_primary_color = np.array([255, 255, 225])
 general_loot_particle_secondary_color = np.array([255, 240, 140])
 general_loot_particle_colors_deviation = 60
 general_loot_particle_search_radius = 40
-loot_min_size = 15
+loot_min_size = 10
 
 corpse_particles_base_color = np.array([255, 234, 153])
 corpse_min_fragment_pixels = 500

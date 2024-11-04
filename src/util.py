@@ -1,3 +1,8 @@
+from PIL import Image
+import threading
+import datetime
+import os
+
 debug_show_progress_visuals = True
 debug_show_progress_log = True
 debug_show_result_visuals = True
@@ -5,6 +10,31 @@ debug_show_result_log = True
 log_limit = 10000000
 
 current_log = []
+output_folder = None
+output_index = 0
+
+def init_output_directory(path=None):
+    global output_folder, output_index
+    if path is None:
+        launch_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = f'output/{launch_time}/'
+
+    os.makedirs(path)
+    result_log(f"Output folder created: {path}")
+    output_folder = path
+    output_index = 0
+
+def log_image(img, postfix, increment_counter=True):
+    global output_index
+    filename = f'{output_folder}/{output_index}-{postfix}.png'
+    img_copy = img.copy()
+    if increment_counter: output_index += 1
+    save_thread = threading.Thread(target=lambda: Image.fromarray(img_copy).save(filename))
+    save_thread.start()
+
+# maybe add some option to disable debug logs specifically
+def debug_log_image(img, postfix, increment_counter=True):
+    log_image(img, postfix, increment_counter)
 
 def log(str):
     global current_log
