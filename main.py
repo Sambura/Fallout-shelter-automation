@@ -59,7 +59,7 @@ def detect_rooms(pixels, return_fragments=False):
         
         # progress_log(f'New room fragment: {fragment.bounds}')
         if debug_show_progress_visuals and np.all(pixels.shape[:2] == screen_shape):
-            debug_output[mask == fragment.fragment_value] = 70
+            draw_border(debug_output, fragment.bounds, np.array([255, 0, 0, 255]), thickness=1)
 
         valid_room, location = analyze_room(fragment)
         if not valid_room: continue
@@ -69,8 +69,8 @@ def detect_rooms(pixels, return_fragments=False):
         detected_fragments.append(fragment)
 
         result_log(f'Room detected! {fragment.bounds} : {room_type}, location: {location}')
-        if debug_show_result_visuals:
-            debug_output[fragment.bounds.to_slice()] += np.array([255, 0, 255, 100])
+        if debug_show_result_visuals and np.all(pixels.shape[:2] == screen_shape):
+            draw_border(debug_output, fragment.bounds, np.array([0, 0, 180, 255]), thickness=3)
 
     if return_fragments: return detected_fragments
     return rooms_detected
@@ -229,6 +229,7 @@ def detect_enemies(pixels):
 # and messes up with structural detection
 @print_durations()
 def detect_structural_rooms(structural: Fragment):
+    if structural is None: return []
     create_debug_frame()
     structural.compute(patch_mask=True)
     structure = structural.patch_mask # patch_mask is true everywhere where there is structural 
@@ -254,7 +255,7 @@ def detect_structural_rooms(structural: Fragment):
         
         # progress_log(f'Detected structural room ({fragment.bounds}) : border fraction {rect_fraction*100:0.2f}%, clearance: {clearance_fraction*100:0.2f}%')
         if debug_show_progress_visuals:
-            debug_output[rooms[-1].to_slice()] += get_debug_color(fragment.fragment_value)
+            draw_border(debug_output, rooms[-1], get_debug_color(fragment.fragment_value), thickness=2)
 
     return rooms
 
@@ -262,7 +263,7 @@ def detect_structural_rooms(structural: Fragment):
 def detect_dialogue_buttons(pixels):
     create_debug_frame()
     fragments_mask = match_color_fuzzy(pixels, primary_dialogue_button_color, dialogue_button_color_max_deviation)
-    fragments = detect_fragments(pixels, fragments_mask)
+    fragments, _, _, _ = detect_fragments(pixels, fragments_mask)
     detected = []
 
     for fragment in fragments:
@@ -313,56 +314,68 @@ def detect_loot(pixels):
         debug_log_image(frames[i], f'loot-frame-{i}')
 
     delete_debug_frame()
-    progress_log(f'Frames collected, analyzing...')
-    
-    masks = [ detect_blending_pixels(x, general_loot_particle_primary_color, 
-        general_loot_particle_secondary_color, max_deviation=general_loot_particle_colors_deviation) for x in frames ]
+    progress_log(f'Frames collected, computing...')
 
-    progress_log(f'Frames processed')
+    color_diffs = [np.abs(x.astype(int) - y).astype(np.uint8) for x, y in zip(frames[:-1], frames[1:])] # colorful diffs
+    any_changes = np.sum([np.any(x > 0, axis=2) for x in color_diffs], axis=0) > 0 # mask where at least one pixel changed
+    # not `scores` anymore but ok
+    scores = [match_color_tone(x, loot_particles_base_color, min_pixel_value=100, tolerance=10) for x in color_diffs] # scores for loot detection
 
-    # starting corspse detection
-    color_diffs = [np.abs(x.astype(int) - y).astype(np.uint8) for x, y in zip(frames[:-1], frames[1:])]
+    # debug snippet
+    # debug_output[:, :, 3] = 255
+    # for i in range(len(color_diffs)):
+    #     progress_log(f'showing diff #{i + 1}')
+    #     debug_output[:, :, :3] = color_diffs[i]
+    #     sleep(2.5)
+    #     progress_log(f'showing scores')
+    #     debug_output[:, :, 0] = scores[i] * 255
+    #     debug_output[:, :, 1] = scores[i] * 255
+    #     debug_output[:, :, 2] = 0
+    #     sleep(2.5)
+    # debug snippet
 
-    matches = [match_cont_color(x, corpse_particles_base_color, corpse_color_detection_threshold) for x in color_diffs]
-    for x, y in zip(matches, color_diffs): x[np.all(y == 0, axis=2)] = 0
-    cum_match = np.sum(matches, axis=0) > 0
+    matches = [match_cont_color(x, corpse_particles_base_color, corpse_color_detection_threshold) for x in color_diffs] # matches for corpse detection
+    # pos_matches = np.sum(scores, axis=0) * any_changes > 0 # pixels that match loot
+    pos_matches = np.sum(scores, axis=0) * any_changes > 0 # pixels that match loot
+    neg_matches = any_changes ^ pos_matches # pixels that don't match loot
+    s_scores = pos_matches.astype(int) - neg_matches.astype(int) # combination of last 2
+    for x, y in zip(matches, color_diffs): x[np.all(y == 0, axis=2)] = 0 # filter matches (?)
+    cum_match = np.sum(matches, axis=0) > 0 # cumulative matches
+    # debug_output[:,:,0] = 255 * neg_matches
+    # debug_output[:,:,2] = 255 * pos_matches
+    # debug_output[:,:,3] = 255 * any_changes
 
-    progress_log(f'Matches calculated')
-
+    progress_log(f'Convolving...')
     kernel_size = 11
     threshold = 0.75
     smoothed = convolve2d(cum_match.astype(int), np.ones((kernel_size, kernel_size)), mode='same')
     filtered_mask = smoothed > kernel_size * kernel_size * threshold
 
-    fragments_c, _, _, f_mask = detect_fragments(filtered_mask, filtered_mask)
+    progress_log(f'Detecting fragments...')
 
-    for i in range(len(fragments_c))[::-1]:
-        if fragments_c[i].point_count < corpse_min_fragment_pixels:
-            progress_log(f'Discarded corpse candidate: no enouch pixels: {fragments_c[i].bounds}')
-            del fragments_c[i]
+    loot_frags, _, _, loot_frag_mask = detect_fragments(s_scores.reshape(*s_scores.shape, 1), s_scores != 0, masked_patch=True)
+    corpse_frags, _, _, corpse_frag_mask = detect_fragments(filtered_mask, filtered_mask)
 
-    # corpse detection over
+    for i in range(len(corpse_frags))[::-1]:
+        if corpse_frags[i].point_count < corpse_min_fragment_pixels:
+            progress_log(f'Discarded corpse candidate: not enouch pixels: {corpse_frags[i].bounds}')
+            del corpse_frags[i]
 
-    m_diffs = [x != y for x, y in zip(masks[:-1], masks[1:])]
-    diffs = [np.any(x != y, axis=2) for x, y in zip(frames[:-1], frames[1:])] # masks for changed pixels
-    diff_sum = np.sum(m_diffs, axis=0) > 0 # mask for pixels that changed during frames AND have loot-ish colors
-    
-    progress_log(f'Got initial diff mask, making second pass...')
+    for fragment in loot_frags[:]: # copy list
+        fragment_val = np.mean(fragment.masked_patch)
+        if fragment_val < 0: 
+            loot_frags.remove(fragment)
+            continue
+        # progress_log(f'Fragment: {fragment.bounds}, value: {fragment_val}')
 
-    cum_diffs = np.sum([x * diff_sum > 0 for x in diffs], axis=0) # how many times each pixel changed during frames (masked by diff_sum)
-    cum_diffs = cum_diffs.astype(float) / search_iterations
+        draw_border(debug_output, fragment.bounds, get_debug_color(randrange(10)), 1)
 
-    loot_threshold = 0.25 # pixels that changed 25% of time or less are candidates for loot
-    loot_candidates_mask = np.logical_and(cum_diffs <= loot_threshold, cum_diffs > 0) # 
-
-    fragments, _, _, _ = detect_fragments(loot_candidates_mask, loot_candidates_mask)
-    groups = group_fragments(fragments, general_loot_particle_search_radius)
+    groups = group_fragments(loot_frags, general_loot_particle_search_radius)
     group_bounds = [Bounds.from_points(*[y for x in group for y in x.bounds.get_corners()]) for group in groups]
 
-    progress_log(f'Finished grouping candidate fragments, groups: {len(groups)}')
+    progress_log(f'Grouped fragments: {len(groups)} groups')
 
     filtered_groups = []
-
     for i, group in enumerate(groups):
         if group_bounds[i].are_smaller_than(loot_min_size):
             progress_log(f'Discarding too small group: {group_bounds[i]}')
@@ -375,7 +388,7 @@ def detect_loot(pixels):
 
         draw_border(debug_output, group_bounds[i].offset(central_room.low_pos), np.array([28, 125, 199, 255]), 3)
 
-    for fragment in fragments_c:
+    for fragment in corpse_frags:
         if fragment.bounds.are_smaller_than(corpse_min_fragment_size):
             progress_log(f'Discarding corpse candidate: {fragment.bounds}')
             continue
@@ -461,17 +474,28 @@ FSA_overlay = np.ones((*screen_shape, 4), dtype=np.uint8) * np.array([255, 0, 0,
 FSA_overlay_loading = np.ones((*screen_shape, 4), dtype=np.uint8) * np.array([180, 255, 0, 255])
 FSA_overlay[1:-1,1:-1] = 0
 FSA_overlay_loading[2:-2,2:-2] = 0
+overlay_on = True
 
 debug_output = None
 debug_frames = []
 max_debug_frames = 3
 
-def clear_debug_canvas(): 
+def clear_debug_canvas():
+    # remove function from places?
     global debug_output
     debug_output *= 0
 
+def combine_images_alpha_mixing(images):
+    result = np.zeros_like(images[0])
+    for img in images:
+        alpha_mask = img[:, :, 3] != 0
+        alpha_values = img[:, :, 3][alpha_mask].astype(float) / 255
+        if np.sum(alpha_mask) == 0: continue
+        result[alpha_mask] = (1 - alpha_values).reshape(-1, 1) * result[alpha_mask] + alpha_values.reshape(-1, 1) * img[alpha_mask]
+    return result
+
 def display_debug():
-    update_overlay(np.sum(debug_frames, axis=0), autoshow=False)
+    update_overlay(combine_images_alpha_mixing(debug_frames), autoshow=False)
 
 def create_debug_frame():
     global debug_output, debug_frames
@@ -496,12 +520,12 @@ def terminate():
     terminate_pending = True
     return False
 
-def hide_overlay(): panel.place_forget(); log_label.pack_forget()
+def hide_overlay(): global overlay_on; panel.place_forget(); log_label.pack_forget(); overlay_on = False
 
 def no_overlay_grab_screen(rect=None):
     global screen_img
     hide_overlay()
-    sleep(0.02) # last tried: 0.01, sometimes overlay still gets captured
+    sleep(0.06) # last tried: 0.05, sometimes overlay still gets captured
     screen = grab_screen(rect)
     if rect is None: screen_img = screen
     show_overlay()
@@ -624,6 +648,11 @@ def chord_handler(key):
             mission_ctl = True
         elif key.char == 'l':
             show_log = not show_log
+            if overlay_on:
+                if show_log:
+                    log_label.pack(side='left')
+                else:
+                    log_label.pack_forget()
         else: progress_log('Unknown chord...')
 
 init_output_directory()
@@ -666,10 +695,10 @@ def update():
         task.start()
 
 def show_overlay():
+    global overlay_on
     panel.place(relheight=1, relwidth=1)
     if show_log: log_label.pack(side='left')
-
-diff_image = no_overlay_grab_screen(None)
+    overlay_on = True
 
 def update_overlay(image=0, autoshow=True):
     image_data = np.clip(image + FSA_overlay, 0, 255).astype(np.uint8)
@@ -681,6 +710,16 @@ def update_overlay(image=0, autoshow=True):
         panel.image = new_overlay
     
     if autoshow: show_overlay()
+
+diff_image = no_overlay_grab_screen(None)
+if False: # mock grab screen
+    load_mock_frames('_refs/general_loot_frames2/')
+    set_grab_screen(mode='mock')
+    max_debug_frames = 100
+    create_debug_frame()
+    debug_output[:, :, :3] = get_mock_frames()[0]
+    debug_output[:, :, 3] = 255
+    create_debug_frame()
 
 def direction_to_screen_center(loc: Bounds, blocked: str):
     if not is_horizontal(blocked):
@@ -755,13 +794,29 @@ def is_room_click(diff: np.ndarray):
     # check there are pixels in border area in each of the 4 quadrants
     return np.any(border[:hh, :hw]) and np.any(border[:hh, hw:]) and np.any(border[hh:, :hw]) and np.any(border[hh:, hw:])
 
-def navigate_to_room(room_bounds, click=True):
+def navigate_to_room(room_bounds: Bounds, click=True):
     progress_log(f'Navigating to the room... : {room_bounds}')
 
     pan_duration = camera_pan_initial_duration
     last_direction = None
     last_bounds = Bounds(*(np.ones(4)*(-10000000000))) # idk lol
     blocked_direction = None
+
+    room_anchors = room_bounds.get_corners(get_8=True)
+    furthest_anchor_i = np.argmax([np.linalg.norm(x) for x in np.array(room_anchors) - screen_center_xy])
+    # cursor at the edge of the screen will pan camera, make sure to clip position
+    zoom_point = np.clip(room_anchors[furthest_anchor_i], [40, 40], screen_shape_xy - 41)
+    zoom_in(*zoom_point)
+    progress_log('zoomed in, rediscovering room...')
+    sleep(1.5)
+    no_overlay_grab_screen() # will need to find room again after zoom-in
+    rooms = detect_rooms(screen_img)
+    if len(rooms) == 0:
+        progress_log('Navigation: target lost')
+        return False, None, None
+    
+    # find room closest to where we had cursor for zooming in
+    room_bounds = rooms[np.argmin([np.linalg.norm(zoom_point - x.pos) for z, y, x in rooms])][2]
 
     direction = direction_to_screen_center(room_bounds, blocked_direction)
     while direction is not None:
@@ -1077,8 +1132,9 @@ def mission_script():
         no_overlay_grab_screen() # grab screen for this iteration
         debug_log_image(screen_img, 'iteration-capture')
         clear_debug_canvas()
-        battle_iteration() # take care of meds / crits
+        battle_iteration() # take care of meds / crits (if any)
 
+        # our next action - go to the new room, detect some..
         rooms = detect_rooms(screen_img)
 
         if len(rooms) == 0:
@@ -1089,7 +1145,8 @@ def mission_script():
         last_iteration_room_detected = True
 
         progress_log(f'Found room: {rooms[0][2]}, type: {rooms[0][0]}')
-        navigate_successful, room_bounds, pre_click_img = navigate_to_room(rooms[0][2])
+        last_room_type = rooms[0][0]
+        navigate_successful, room_bounds, pre_click_img = navigate_to_room(rooms[0][2], click=True)
         if not navigate_successful: continue
         progress_log(f'Room navigation successful, waiting for walk complete...')
         last_rooms = detect_rooms(no_overlay_grab_screen())
@@ -1158,9 +1215,6 @@ def mission_script():
                 else:
                     proceed = True # unconfirmed, but new room - no need to stay
 
-            if not in_dialogue: # if not in dialogue, we are still not zoomed in
-                zoom_in(*room_bounds.pos)
-
             while have_enemies:
                 no_overlay_grab_screen() # grab screen for this iteration
                 debug_log_image(screen_img, 'battle-iteration-capture')
@@ -1193,12 +1247,13 @@ def mission_script():
                     progress_log(f'Dialog over!')
                     break
         
-        progress_log(f'Proceeding to loot collection!')
-        loot_bounds = detect_loot(no_overlay_grab_screen())
-        progress_log(f'Detected {len(loot_bounds)} loots')
-        for loot in loot_bounds:
-            mouse_click(*loot.pos)
-            sleep(0.4)
+        if last_room_type != 'elevator':
+            progress_log(f'Proceeding to loot collection!')
+            loot_bounds = detect_loot(no_overlay_grab_screen())
+            progress_log(f'Detected {len(loot_bounds)} loots')
+            for loot in loot_bounds:
+                mouse_click(*loot.pos)
+                sleep(0.4)
 
         progress_log('Noting to do, proceeding to next iteration')
         continue

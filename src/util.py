@@ -4,6 +4,7 @@ import datetime
 import os
 
 debug_show_progress_visuals = True
+debug_log_images = True
 debug_show_progress_log = True
 debug_show_result_visuals = True
 debug_show_result_log = True
@@ -34,6 +35,7 @@ def log_image(img, postfix, increment_counter=True):
 
 # maybe add some option to disable debug logs specifically
 def debug_log_image(img, postfix, increment_counter=True):
+    if not debug_log_images: return
     log_image(img, postfix, increment_counter)
 
 def log(str):

@@ -2,6 +2,7 @@ from PIL import ImageGrab, Image
 import matplotlib.pyplot as plt
 import numpy as np
 import cv2
+import os
 
 # local terms:
 #       bounds: instance of Bounds class
@@ -12,7 +13,52 @@ def grab_real_screen(bbox):
     if bbox is not None: bbox = [bbox[0], bbox[1], bbox[2] + 1, bbox[3] + 1]
     return np.array(ImageGrab.grab(bbox))
 
-grab_screen = grab_real_screen
+mock_frames = None
+mock_index = 0
+mock_mode = None
+
+# frames / fixed mode
+def set_mock_frames(frames, mode='frames'):
+    global mock_frames, mock_index, mock_mode
+    mock_frames = frames
+    mock_index = 0
+    mock_mode = mode
+
+def get_mock_frames(): return mock_frames 
+
+def load_mock_frames(path, mode='frames'):
+    frames = []
+
+    for filename in os.listdir(path):
+        if filename.endswith(".jpg") or filename.endswith(".png"):
+            img_path = os.path.join(path, filename)
+            img = Image.open(img_path)
+            img_array = np.array(img)
+            frames.append(img_array)
+    
+    print(f'Loaded {len(frames)} mock frames')
+    set_mock_frames(frames, mode)
+
+def grab_mock_screen(bbox):
+    global mock_index
+    index = mock_index
+    if mock_mode != 'fixed': mock_index += 1
+    return mock_frames[index].copy()
+
+__grab_screen = grab_real_screen
+
+def set_grab_screen(mode='real'):
+    global __grab_screen
+    if mode == 'real':
+        print('Warning: grab function set to real')
+        __grab_screen = grab_real_screen
+    elif mode == 'mock':
+        print('Warning: grab function set to mock')
+        __grab_screen = grab_mock_screen
+    else:
+        raise 'error'
+
+def grab_screen(*args): return __grab_screen(*args)
 
 DEBUG_COLORS = (np.array([plt.get_cmap('rainbow')(i) for i in np.linspace(0, 1, 8)]) * 255).astype(int)
 
@@ -37,8 +83,11 @@ class Bounds:
     def from_rect(x, y, width, height):
         return Bounds(x, y, x + width - 1, y + height - 1)
 
-    def get_corners(self):
-        return [(self.x_min, self.y_min), (self.x_min, self.y_max), (self.x_max, self.y_min), (self.x_max, self.y_max)]
+    def get_corners(self, get_8=False):
+        corners = [(self.x_min, self.y_min), (self.x_min, self.y_max), (self.x_max, self.y_min), (self.x_max, self.y_max)]
+        if get_8:
+            return [*corners, (self.x_min, self.y), (self.x_max, self.y), (self.x, self.y_min), (self.x, self.y_max)]
+        return corners
 
     def to_rect(self):
         return [self.x_min, self.y_min, self.width, self.height]
@@ -172,14 +221,30 @@ def match_color_fuzzy(pixels, color, max_deviation):
     "Simple fuzzy matcher, matches any pixels that are up to `max_deviation` far from `color`"
     return np.sum(np.abs(pixels - color), axis=2) <= max_deviation
 
+def match_color_tone(pixels, color, min_pixel_value=0, tolerance=0):
+    """
+    Allows to match any pixels that have the same tone as `color` (e.g. `color` or darker)
+    Use `min_pixel_value` to mask all pixels that are too dark. This is the min value of r+g+b of pixel
+    Tolerance controls how close the color tone should be to the `color` to match
+    """
+    pixel_values = np.sum(pixels, axis=2)
+    mask = pixel_values >= min_pixel_value
+    color_grads = np.mean(pixels.astype(float) / color, axis=2)
+    recolor = color_grads.reshape(*color_grads.shape, 1) * color.reshape(1, -1)
+    deviations = np.sum(np.abs(pixels - recolor), axis=2)
+    return (deviations <= tolerance) * mask
+
+def match_cont_color_values(pixels, color):
+    color_grads = np.mean(pixels.astype(float) / color, axis=2)
+    recolor = color_grads.reshape(*color_grads.shape, 1) * color.reshape(1, -1)
+    return np.sum(np.abs(pixels - recolor), axis=2)
+
 def match_cont_color(pixels, color, tolerance):
     """
     Use when you need to match pixels that have any color you can get by multiplying
     a number from 0 to 1 by the `color` (so any color from black up to `color`)
     """
-    color_grads = np.mean(pixels.astype(float) / color, axis=2) 
-    recolor = color_grads.reshape(*color_grads.shape, 1) * color.reshape(1, -1)
-    return np.sum(np.abs(pixels - recolor), axis=2) <= tolerance
+    return match_cont_color_values(pixels, color) <= tolerance
 
 def detect_blending_pixels(pixels, primary_color, secondary_color, max_blending=1, max_deviation=0):
     """
@@ -208,15 +273,20 @@ def detect_blending_pixels(pixels, primary_color, secondary_color, max_blending=
     return np.logical_or(masked_results, close_pixels) # restore cut off pixels close to endpoints 
 
 def is_fragment_rectangular(fragment: Fragment, report_fraction=False):
+    if fragment.bounds.area == 0: return None
     if not hasattr(fragment, 'patch_mask'): fragment.compute(patch_mask=True)
 
     rect_mask = np.ones(fragment.bounds.shape, dtype=bool)
     rect_mask[1:-1, 1:-1] = False
 
     # same as np.sum(rect_mask)
-    mask_ones_count = 2 * (rect_mask.shape[0] + rect_mask.shape[1] - 2)
+    if rect_mask.shape[0] == 1 or rect_mask.shape[1] == 1:
+        mask_ones_count = rect_mask.shape[0] + rect_mask.shape[1] - 1
+    else:
+        mask_ones_count = 2 * (rect_mask.shape[0] + rect_mask.shape[1] - 2)
     mask_ones_count2 = np.sum(rect_mask)
     if mask_ones_count != mask_ones_count2: raise 'wtf'
+
     matching_pixels = np.sum(np.logical_and(fragment.patch_mask, rect_mask))
     matching_fraction = matching_pixels / mask_ones_count
  

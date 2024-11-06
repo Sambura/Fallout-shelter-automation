@@ -59,11 +59,12 @@ min_dialogue_button_border_fraction = 0.9
 dialogue_button_max_center_deviation_rel = 0.05
 
 # Particles
+loot_particles_base_color = np.array([255, 228, 131])
 general_loot_particle_primary_color = np.array([255, 255, 225])
 general_loot_particle_secondary_color = np.array([255, 240, 140])
 general_loot_particle_colors_deviation = 60
 general_loot_particle_search_radius = 40
-loot_min_size = 10
+loot_min_size = 9
 
 corpse_particles_base_color = np.array([255, 234, 153])
 corpse_min_fragment_pixels = 500
