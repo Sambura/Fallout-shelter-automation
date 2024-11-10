@@ -3,19 +3,24 @@ import matplotlib.pyplot as plt
 import numpy as np
 import cv2
 import os
+import platform
+from .util import result_log
 
 # local terms:
 #       bounds: instance of Bounds class
 #       bbox: array/tuple of numbers [x0, y0, x1, y1]
 #       rect: array/tuple of numbers [x0, y0, width, height]
 
-def grab_real_screen(bbox):
+def pil_screen_capture(bbox):
     if bbox is not None: bbox = [bbox[0], bbox[1], bbox[2] + 1, bbox[3] + 1]
     return np.array(ImageGrab.grab(bbox))
 
 mock_frames = None
 mock_index = 0
 mock_mode = None
+
+__capture_func = pil_screen_capture
+__finish_func = None
 
 # frames / fixed mode
 def set_mock_frames(frames, mode='frames'):
@@ -39,26 +44,68 @@ def load_mock_frames(path, mode='frames'):
     print(f'Loaded {len(frames)} mock frames')
     set_mock_frames(frames, mode)
 
-def grab_mock_screen(bbox):
+def grab_mock_screen(bbox=None):
     global mock_index
     index = mock_index
     if mock_mode != 'fixed': mock_index += 1
-    return mock_frames[index].copy()
+    img = mock_frames[index].copy()
+    if bbox is None: return img
+    return img[bbox[0]:bbox[2]+1, bbox[1]:bbox[3]+1]
 
-__grab_screen = grab_real_screen
+def init_screen_capture(mode='real', window_title=None, mock_directory=None, mock_mode='frames', use_native=True):
+    """Performs necessary initializations for screen/window capture.
 
-def set_grab_screen(mode='real'):
-    global __grab_screen
+    Parameters:
+        mode (str): either 'real' for capturing actual screen or 'mock' for mocking screen capture
+        window_title (str): should be specified if 'real' mode is selected - window title to be captured
+        mock_directory (str): may be specified if 'mock' mode is selected - path to directory with mock frames
+        mock_mode (str): 'frames' for mock screen capture to return all found frames sequentially, or 'fixed' to return the first frame every time
+        use_native (bool): set to False to use generic capture function even if native is available (only for mode == 'real')
+    
+    Returns: a tuple (func, bool) with a function to be used for screen capture (with optional bbox parameter); and bool indicating whether 
+        capture function has native implementation (True) or generic (False) 
+    """
+    global __capture_func, __finish_func
+    native_capture = False
+
     if mode == 'real':
-        print('Warning: grab function set to real')
-        __grab_screen = grab_real_screen
-    elif mode == 'mock':
-        print('Warning: grab function set to mock')
-        __grab_screen = grab_mock_screen
-    else:
-        raise 'error'
+        if platform.system() == 'Windows' and use_native:
+            from .windows_screen_capture import init_window_capture, do_capture, finish_window_capture
+            if window_title is None: raise Exception('Should specify window_title for native windows capture')
+            if not init_window_capture(window_title):
+                result_log('Critical: could not find a window to capture. Fallback to PIL capture')
+                __capture_func = pil_screen_capture
+                return __capture_func, False
 
-def grab_screen(*args): return __grab_screen(*args)
+            __finish_func = finish_window_capture
+
+            def windows_capture_func(bbox=None):
+                img = do_capture()
+                if bbox is None: return img
+                return img[bbox[1]:bbox[3]+1, bbox[0]:bbox[2]+1]
+
+            __capture_func = windows_capture_func
+            native_capture = True
+        else:
+            __capture_func = pil_screen_capture
+
+    elif mode == 'mock':
+        print('Warning: capture function set to mock')
+        
+        __capture_func = grab_mock_screen
+        native_capture = True
+
+        if mock_directory is not None:
+            load_mock_frames(mock_directory, mock_mode)
+    else:
+        raise Exception('mode should be `real` or `mock`')
+
+    return __capture_func, native_capture
+
+def finish_screen_capture():
+    """Deinitialize screen capture"""
+    if __finish_func is not None:
+        __finish_func()
 
 DEBUG_COLORS = (np.array([plt.get_cmap('rainbow')(i) for i in np.linspace(0, 1, 8)]) * 255).astype(int)
 

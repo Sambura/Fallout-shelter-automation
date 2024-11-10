@@ -307,7 +307,7 @@ def detect_loot(pixels):
     frames = []
     for x in range(search_iterations):
         start_time = perf_counter()
-        frames.append(no_overlay_grab_screen(rect=central_room.get_bbox()))
+        frames.append(no_overlay_grab_screen(central_room.get_bbox()))
         sleep(max(0, 1 / fps - (perf_counter() - start_time)))
 
     for i in range(search_iterations):
@@ -449,6 +449,7 @@ current_execution_target = None
 mission_ctl = False
 show_log = True
 last_key_pressed = None
+grab_screen, native_grab_screen = init_screen_capture(mode='real', window_title='Fallout Shelter')
 
 def update_overlay(param): pass
 
@@ -522,14 +523,34 @@ def terminate():
 
 def hide_overlay(): global overlay_on; panel.place_forget(); log_label.pack_forget(); overlay_on = False
 
-def no_overlay_grab_screen(rect=None):
+def no_overlay_grab_screen(bbox=None):
     global screen_img
     hide_overlay()
     sleep(0.06) # last tried: 0.05, sometimes overlay still gets captured
-    screen = grab_screen(rect)
-    if rect is None: screen_img = screen
+    screen = grab_screen(bbox)
+    if bbox is None: screen_img = screen
     show_overlay()
     return screen
+
+def no_overlay_grab_screen_native(bbox=None):
+    global screen_img
+    screen = grab_screen(bbox)
+    if bbox is None: screen_img = screen
+    return screen
+
+if native_grab_screen:
+    no_overlay_grab_screen = no_overlay_grab_screen_native
+    result_log('Native screen capture succesfully initialized')
+
+# ???? do something with this
+if False: # mock grab screen
+    load_mock_frames('_refs/general_loot_frames2/')
+    set_grab_screen(mode='mock')
+    max_debug_frames = 100
+    create_debug_frame()
+    debug_output[:, :, :3] = get_mock_frames()[0]
+    debug_output[:, :, 3] = 255
+    create_debug_frame()
 
 def start_chord():
     global shortcut_chord_pending
@@ -662,7 +683,7 @@ root.attributes('-transparentcolor','#f0f0f0')
 root.attributes("-topmost", True)   
 
 log(
-'''Fallout Shelter Automation: v0.4.1
+'''Fallout Shelter Automation: v0.4.2
 Start mission script: Ctrl + F; Enter (Esc to terminate)
 Toggle log display: Ctrl + F; L
 Shutdown: Ctrl + F; Esc
@@ -683,7 +704,9 @@ def update():
 
     if terminate_pending: 
         print('Terminating...')
+        finish_screen_capture()
         quit()
+    
     root.after(update_interval, update)
     fcounter += 1
     if fcounter % 25 == 0: display_debug()
@@ -712,14 +735,6 @@ def update_overlay(image=0, autoshow=True):
     if autoshow: show_overlay()
 
 diff_image = no_overlay_grab_screen(None)
-if False: # mock grab screen
-    load_mock_frames('_refs/general_loot_frames2/')
-    set_grab_screen(mode='mock')
-    max_debug_frames = 100
-    create_debug_frame()
-    debug_output[:, :, :3] = get_mock_frames()[0]
-    debug_output[:, :, 3] = 255
-    create_debug_frame()
 
 def direction_to_screen_center(loc: Bounds, blocked: str):
     if not is_horizontal(blocked):
@@ -752,12 +767,14 @@ def restore_offset(bounds, clip_bounds):
     return Bounds(bounds.x_min + x, bounds.y_min + y, bounds.x_max + x, bounds.y_max + y)
 
 def mouse_click(x, y):
+    restore_overlay = overlay_on
     hide_overlay()
     mouse_input.position = (x, y)
     sleep(0.07)
     mouse_input.press(mouse.Button.left)
     sleep(0.12)
     mouse_input.release(mouse.Button.left)
+    if restore_overlay: show_overlay()
 
 def dialogue_random_handler(buttons):
     button_index = randrange(len(buttons))
@@ -928,7 +945,7 @@ def make_critical_strike(crit_bounds):
             if crit_pixels < min_crit_pixels:
                 crit_over = True
             else:
-                hit_times[-1].append(timestamp)
+                if len(hit_times) > 0: hit_times[-1].append(timestamp)
                 continue
 
         if cue_pixels < last_cue_pixels and crit_pixels > last_crit_pixels:
