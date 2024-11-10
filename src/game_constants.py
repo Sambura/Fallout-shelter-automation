@@ -67,6 +67,6 @@ general_loot_particle_search_radius = 40
 loot_min_size = 9
 
 corpse_particles_base_color = np.array([255, 234, 153])
-corpse_min_fragment_pixels = 500
-corpse_min_fragment_size = 50
+corpse_min_fragment_pixels = 300
+corpse_min_fragment_size = 35
 corpse_color_detection_threshold = 0.5

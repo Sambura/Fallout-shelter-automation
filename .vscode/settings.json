@@ -1,9 +1,39 @@
 {
     "cSpell.ignoreWords": [
+        "PDEBUG",
+        "RDEBUG",
+        "astype",
+        "bmpstr",
         "clickdiff",
+        "cmap",
+        "crits",
+        "deadzone",
+        "dtype",
+        "fromarray",
+        "frombuffer",
+        "funcy",
+        "linalg",
+        "ndarray",
+        "newaxis",
         "postclick",
         "preclick",
-        "rescan"
+        "pynput",
+        "relheight",
+        "relwidth",
+        "rescan",
+        "transparentcolor"
     ],
-    "cSpell.enabled": false
+    "cSpell.enabled": true,
+    "cSpell.words": [
+        "Antirad",
+        "argmax",
+        "argmin",
+        "autoshow",
+        "FLOODFILL",
+        "fullscreen",
+        "healthbar",
+        "levelup",
+        "meds",
+        "Stimpak"
+    ],
 }

@@ -1,10 +1,11 @@
+from .debug import result_log
+
 from PIL import ImageGrab, Image
 import matplotlib.pyplot as plt
 import numpy as np
 import cv2
 import os
 import platform
-from .util import result_log
 
 # local terms:
 #       bounds: instance of Bounds class
@@ -103,7 +104,7 @@ def init_screen_capture(mode='real', window_title=None, mock_directory=None, moc
     return __capture_func, native_capture
 
 def finish_screen_capture():
-    """Deinitialize screen capture"""
+    """De-initialize screen capture"""
     if __finish_func is not None:
         __finish_func()
 
