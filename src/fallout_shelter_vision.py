@@ -6,6 +6,7 @@ from .vision import *
 from .game_constants import *
 from .drawing import *
 from .visual_debug import *
+from .util import *
 
 import numpy as np
 from scipy.signal import convolve2d
@@ -233,6 +234,8 @@ def detect_enemies(pixels):
 # primary problem is that sometimes some text appears above characters
 # and messes up with structural detection
 @print_durations()
+# TODO: small bumps on room bounds can lead to detection of too large room (e.g. text overlaps with structural)
+# fix that at some point....
 def detect_structural_rooms(structural: Fragment):
     if structural is None: return []
     create_debug_frame()
@@ -305,19 +308,19 @@ def detect_loot(pixels, grab_screen_func):
         progress_log(f'!Critical: failed to detect central room! Fallback to whole screen')
         central_room = Bounds(0, 0, screen_shape[0] - 1, screen_shape[1] - 1)
     else:
-        progress_log(f'Detected main room for loot collection: {central_room}')
+        # TODO: when not using full-screen capture, coordinates are not properly compensated, fix that (or is it fine?)
         # central_room = Bounds(0, 0, screen_shape[0] - 1, screen_shape[1] - 1)
+        progress_log(f'Detected main room for loot collection: {central_room}')
     
     search_iterations = 24
-    fps = 8
-    progress_log(f'Loot collection start: {search_iterations} frames at {fps} FPS')
+    search_interval = 1 / 8 # 8 fps
+    progress_log(f'Loot collection start: {search_iterations} frames at {1 / search_interval} FPS')
     
     # collect frame data
     frames = []
-    for x in range(search_iterations):
-        start_time = perf_counter()
+    for x in slow_loop(interval=search_interval, max_iter_count=search_iterations):
         frames.append(grab_screen_func(central_room.get_bbox()))
-        sleep(max(0, 1 / fps - (perf_counter() - start_time)))
+        debug_log_image(frames[-1], f'loot-collection-frame-{x}')
 
     # for i in range(search_iterations):
     #     debug_log_image(frames[i], f'loot-frame-{i}')
@@ -330,16 +333,17 @@ def detect_loot(pixels, grab_screen_func):
     scores = [match_color_tone(x, loot_particles_base_color, min_pixel_value=100, tolerance=10) for x in color_diffs] # scores for loot detection
 
     # debug snippet
-    # get_do()[:, :, 3] = 255
-    # for i in range(len(color_diffs)):
-    #     progress_log(f'showing diff #{i + 1}')
-    #     get_do()[:, :, :3] = color_diffs[i]
-    #     sleep(2.5)
-    #     progress_log(f'showing scores')
-    #     get_do()[:, :, 0] = scores[i] * 255
-    #     get_do()[:, :, 1] = scores[i] * 255
-    #     get_do()[:, :, 2] = 0
-    #     sleep(2.5)
+    if False: # does not work for non-fullscreen capture
+        get_do()[:, :, 3] = 255
+        for i in range(len(color_diffs)):
+            progress_log(f'showing diff #{i + 1}')
+            get_do()[:, :, :3] = color_diffs[i]
+            sleep(2.5)
+            progress_log(f'showing scores')
+            get_do()[:, :, 0] = scores[i] * 255
+            get_do()[:, :, 1] = scores[i] * 255
+            get_do()[:, :, 2] = 0
+            sleep(2.5)
     # debug snippet
 
     matches = [match_cont_color(x, corpse_particles_base_color, corpse_color_detection_threshold) for x in color_diffs] # matches for corpse detection
@@ -376,7 +380,7 @@ def detect_loot(pixels, grab_screen_func):
             continue
         # progress_log(f'Fragment: {fragment.bounds}, value: {fragment_val}')
 
-        draw_border(get_do(), fragment.bounds, get_debug_color(randrange(10)), 1)
+        draw_border(get_do(), fragment.bounds.offset(central_room.low_pos), get_debug_color(randrange(10)), 1)
 
     groups = group_fragments(loot_frags, general_loot_particle_search_radius)
     group_bounds = [Bounds.from_points(*[y for x in group for y in x.bounds.get_corners()]) for group in groups]
@@ -417,3 +421,25 @@ def is_room_click_diff(diff: np.ndarray):
 
     # check there are pixels in border area in each of the 4 quadrants
     return np.any(border[:hh, :hw]) and np.any(border[:hh, hw:]) and np.any(border[hh:, :hw]) and np.any(border[hh:, hw:])
+
+def detect_ui(pixels):
+    "Returns true/false if the UI buttons are on screen (menu, screenshot, mission menu)"
+    # look at corners of screen:
+    #   - top-right: 6% square (mission button)
+    #   - bottom-left: 6% square (screenshot button)
+    #   - bottom-right: 11% square (menu button)
+    shape = pixels.shape[:2]
+    height6 = int(shape[0] * 0.06)
+    width6 = int(shape[1] * 0.06)
+    height11 = int(shape[0] * 0.11)
+    width11 = int(shape[1] * 0.11)
+
+    top_right_patch = pixels[:height6, shape[1] - width6:]
+    bottom_left_patch = pixels[shape[0] - height6:, :width6]
+    bottom_right_patch = pixels[shape[0] - height11:, shape[1] - width11:]
+
+    have_patch1 = np.sum(match_color_exact(top_right_patch, ui_primary_color)) > ui_minimal_pixel_count
+    have_patch2 = np.sum(match_color_exact(bottom_left_patch, ui_primary_color)) > ui_minimal_pixel_count
+    have_patch3 = np.sum(match_color_exact(bottom_right_patch, ui_primary_color)) > ui_minimal_pixel_count
+
+    return have_patch1 and have_patch2 and have_patch3

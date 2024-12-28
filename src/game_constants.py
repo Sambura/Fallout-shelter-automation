@@ -20,8 +20,8 @@ levelup_min_clean_colors = 0.8
 color_ratio_tolerance = 0.15
 critical_cue_color = np.array([253, 222, 0])
 critical_cue_fragment_min_pixels = 25
-critical_hit_color = np.array([17, 243, 20])
-critical_hit_color_deviation = 10
+critical_hit_color = np.array([18, 244, 21])
+min_critical_pixels = 50
 critical_progress_color = np.array([251, 220, 0])
 structural_color = np.array([0, 0, 0])
 enemy_healthbar_border_color = np.array([255, 25, 25])
@@ -70,3 +70,6 @@ corpse_particles_base_color = np.array([255, 234, 153])
 corpse_min_fragment_pixels = 300
 corpse_min_fragment_size = 35
 corpse_color_detection_threshold = 0.5
+
+ui_primary_color = np.array([18, 255, 21])
+ui_minimal_pixel_count = 50

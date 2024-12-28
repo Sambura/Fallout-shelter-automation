@@ -26,9 +26,12 @@ def init_output_directory(path=None):
     output_folder = path
     output_index = 0
 
+def make_output_filename(filename):
+    return f'{output_folder}/{filename}'
+
 def log_image(img, postfix, increment_counter=True):
     global output_index
-    filename = f'{output_folder}/{output_index}-{postfix}.png'
+    filename = make_output_filename(f'{output_index}-{postfix}.png')
     img_copy = img.copy()
     if increment_counter: output_index += 1
     save_thread = threading.Thread(target=lambda: Image.fromarray(img_copy).save(filename))

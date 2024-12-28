@@ -2,12 +2,14 @@
     "cSpell.ignoreWords": [
         "PDEBUG",
         "RDEBUG",
+        "argwhere",
         "astype",
         "bmpstr",
         "clickdiff",
         "cmap",
         "crits",
         "deadzone",
+        "dstack",
         "dtype",
         "fromarray",
         "frombuffer",
@@ -32,6 +34,7 @@
         "FLOODFILL",
         "fullscreen",
         "healthbar",
+        "healthbars",
         "levelup",
         "meds",
         "Stimpak"

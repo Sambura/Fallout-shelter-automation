@@ -1,6 +1,7 @@
 from .debug import result_log
 
 from PIL import ImageGrab, Image
+from scipy.signal import convolve2d
 import matplotlib.pyplot as plt
 import numpy as np
 import cv2
@@ -23,12 +24,16 @@ mock_mode = None
 __capture_func = pil_screen_capture
 __finish_func = None
 
+def reset_mock_frame_index():
+    global mock_index
+    mock_index = 0
+
 # frames / fixed mode
 def set_mock_frames(frames, mode='frames'):
-    global mock_frames, mock_index, mock_mode
+    global mock_frames, mock_mode
     mock_frames = frames
-    mock_index = 0
     mock_mode = mode
+    reset_mock_frame_index()
 
 def get_mock_frames(): return mock_frames 
 
@@ -45,13 +50,16 @@ def load_mock_frames(path, mode='frames'):
     print(f'Loaded {len(frames)} mock frames')
     set_mock_frames(frames, mode)
 
+def crop_image(image, bbox):
+    "Crops image. This is what used for cropping screen grabs"
+    if bbox is None: return image
+    return image[bbox[1]:bbox[3]+1, bbox[0]:bbox[2]+1]
+
 def grab_mock_screen(bbox=None):
     global mock_index
     index = mock_index
     if mock_mode != 'fixed': mock_index += 1
-    img = mock_frames[index].copy()
-    if bbox is None: return img
-    return img[bbox[0]:bbox[2]+1, bbox[1]:bbox[3]+1]
+    return crop_image(mock_frames[index].copy(), bbox)
 
 def init_screen_capture(mode='real', window_title=None, mock_directory=None, mock_mode='frames', use_native=True):
     """Performs necessary initializations for screen/window capture.
@@ -79,13 +87,7 @@ def init_screen_capture(mode='real', window_title=None, mock_directory=None, moc
                 return __capture_func, False
 
             __finish_func = finish_window_capture
-
-            def windows_capture_func(bbox=None):
-                img = do_capture()
-                if bbox is None: return img
-                return img[bbox[1]:bbox[3]+1, bbox[0]:bbox[2]+1]
-
-            __capture_func = windows_capture_func
+            __capture_func = lambda bbox=None: crop_image(do_capture(), bbox)
             native_capture = True
         else:
             __capture_func = pil_screen_capture
@@ -186,6 +188,26 @@ class Bounds:
 
         raise NotImplementedError('only implemented for 1 parameter for now :(')
 
+    def get_iou(self, bounds):
+        "intersection over union of two bounds"
+        x1, y1, x2, y2 = self.get_bbox()
+        x3, y3, x4, y4 = bounds.get_bbox()
+
+        # Compute intersection area
+        intersection_x1 = max(x1, x3)
+        intersection_y1 = max(y1, y3)
+        intersection_x2 = min(x2, x4)
+        intersection_y2 = min(y2, y4)
+
+        intersection_area = max(0, intersection_x2 - intersection_x1) * max(0, intersection_y2 - intersection_y1)
+
+        # Compute union area
+        rect1_area = (x2 - x1) * (y2 - y1)
+        rect2_area = (x4 - x3) * (y4 - y3)
+        union_area = rect1_area + rect2_area - intersection_area
+
+        return intersection_area / union_area if union_area != 0 else 0
+
     def __str__(self):
         return f'(Bounds) x: {self.x} y: {self.y}; {self.width}x{self.height}'
 
@@ -217,7 +239,7 @@ def fragment_mask_prepare(mask):
     return np.pad(np.logical_not(mask), 1, 'constant', constant_values=True).astype(np.uint8)
 
 def detect_fragments(pixels, fragments_mask, **compute_kwargs):
-    "returns list of found fragments, list of x and list of y coordinates derived from fragment_mask"
+    "returns list of found fragments, list of x and list of y coordinates derived from fragment_mask, and the numeric mask (fragments, xs, ys, mask)"
     mask = np.zeros(pixels.shape[:2], dtype=int)
     ys, xs = np.where(fragments_mask)
     fragments_mask = fragment_mask_prepare(fragments_mask)
@@ -344,3 +366,23 @@ def is_fragment_rectangular(fragment: Fragment, report_fraction=False):
 def compute_img_diff_ratio(img1, img2):
     "computes fraction of differing pixels between two images"
     return np.sum(np.any(img1 != img2, axis=2)) / np.prod(img1.shape[:2])
+
+def compute_motion_diff(old_frame, current_frame, future_frame, diff_threshold=None):
+    "Specify integer threshold to ignore too small changes"
+    if diff_threshold is None:
+        pre_diff = np.any(old_frame != current_frame, axis=2)
+        post_diff = np.any(current_frame != future_frame, axis=2)
+    else:
+        pre_diff = np.sum(np.abs(old_frame.astype(int) - current_frame), axis=2) >= diff_threshold
+        post_diff = np.sum(np.abs(current_frame.astype(int) - future_frame), axis=2) >= diff_threshold
+   
+    neutral = np.logical_and(pre_diff, post_diff)
+    positive = post_diff ^ neutral
+    negative = pre_diff ^ neutral
+
+    return np.dstack((negative, positive, neutral))
+
+def box_blur(image, kernel_size):
+    kernel = np.ones((kernel_size, kernel_size)) / (kernel_size * kernel_size)
+    if len(image.shape) == 2: image = image.reshape(*image.shape, 1)
+    return np.dstack([convolve2d(image[:, :, x], kernel, mode='same') for x in range(image.shape[2])])

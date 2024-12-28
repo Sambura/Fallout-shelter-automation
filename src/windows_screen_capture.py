@@ -45,6 +45,7 @@ def do_capture():
     return np.frombuffer(bmpstr, dtype=np.uint8).reshape(height, width, 4)[:,:,:3][:,:,::-1]
 
 def finish_window_capture():
+    # presumably some of these fail if the game is closed at this point
     win32gui.DeleteObject(saveBitMap.GetHandle())
     saveDC.DeleteDC()
     mfcDC.DeleteDC()

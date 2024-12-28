@@ -33,3 +33,9 @@ def delete_debug_frame():
     create_debug_frame()
 
 def get_do(): return debug_output
+
+def get_debug_frame(index):
+    "0 for current frame, -1 for previous, -2, etc."
+    if index > 0: raise Exception('Index should be non-positive')
+    if -index > len(debug_frames) - 1: return None
+    return debug_frames[index]
