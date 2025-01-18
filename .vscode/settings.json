@@ -37,6 +37,8 @@
         "healthbars",
         "levelup",
         "meds",
-        "Stimpak"
+        "scanline",
+        "Stimpak",
+        "usecase"
     ],
 }

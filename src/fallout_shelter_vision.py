@@ -255,8 +255,18 @@ def detect_structural_rooms(structural: Fragment):
         if fragment.bounds.y_max == structural.bounds.height - 1 and structural.bounds.y_max != screen_shape[0] - 1: continue
 
         clearance_fraction = np.sum(hole_pixels[fragment.bounds.to_slice()]) / fragment.bounds.area
-        if clearance_fraction < struct_min_room_clearance_fraction: continue
-        _, rect_fraction = is_fragment_rectangular(fragment, report_fraction=True)
+        if clearance_fraction < struct_min_room_clearance_fraction: 
+            progress_log(f'Filtered out structural room: {clearance_fraction} clearance')
+            continue
+
+        # _, rect_fraction = is_fragment_rectangular(fragment, report_fraction=True)
+        if not hasattr(fragment, 'patch_mask'): fragment.compute(patch_mask=True)
+
+        # cut 10% of pixels from each side before rectangular check (to cut away some potential bumps)
+        dw = int(fragment.bounds.width * 0.1)
+        dh = int(fragment.bounds.height * 0.1)
+
+        _, rect_fraction = _is_fragment_rectangular(fragment.patch_mask[dh:-dh, dw:-dw])
         if rect_fraction < struct_min_room_border_fraction: continue
 
         rooms.append(fragment.bounds.offset(structural.bounds.low_pos))
@@ -267,6 +277,7 @@ def detect_structural_rooms(structural: Fragment):
 
     return rooms
 
+static_loot_general_var = 0
 @print_durations()
 def detect_dialogue_buttons(pixels, screen_size):
     create_debug_frame()
@@ -293,123 +304,240 @@ def detect_dialogue_buttons(pixels, screen_size):
 
     return len(detected) > 0, detected
 
-# TODO: split in two functions, one of which does not require grab_screen (?)
 @print_durations()
-def detect_loot(pixels, grab_screen_func):
-    create_debug_frame()
-    structural, _ = detect_structural(pixels)
-    delete_debug_frame()
-    rooms = detect_structural_rooms(structural)
-    screen_shape = (np.array(pixels.shape[:2][::-1])).astype(int)
-    screen_center = (screen_shape / 2).astype(int)
+def new_detect_loot_general_debug(scan_bounds, grab_screen_func):
+    global static_loot_general_var
+    result_log('[Debug general loot detection]')
 
-    central_room = next((x for x in rooms if x.contains_point(*screen_center)), None)
-    if central_room is None:
-        progress_log(f'!Critical: failed to detect central room! Fallback to whole screen')
-        central_room = Bounds(0, 0, screen_shape[0] - 1, screen_shape[1] - 1)
-    else:
-        # TODO: when not using full-screen capture, coordinates are not properly compensated, fix that (or is it fine?)
-        # central_room = Bounds(0, 0, screen_shape[0] - 1, screen_shape[1] - 1)
-        progress_log(f'Detected main room for loot collection: {central_room}')
+    static_loot_general_var += 1
     
-    search_iterations = 24
-    search_interval = 1 / 8 # 8 fps
+    # collect frame data
+    frames = []
+    interval = 0 # 0.5
+    reset_mock_frame_index()
+    for x in slow_loop(interval=interval, max_iter_count=2):
+        frames.append(grab_screen_func(scan_bounds.get_bbox()))
+
+    frame1, frame2 = frames
+    color_diff = frame1.astype(int) - frame2 # colorful signed diffs
+    # doesn't really make sense, eh?
+    # pos_diff = np.clip(color_diff, 0, 255).astype(np.uint8) # only positive changes
+    # neg_diff = -np.clip(color_diff, -255, 0).astype(np.uint8) # only negative changes
+    unsigned_color_diff = np.abs(color_diff).astype(np.uint8) # color_diffs but unsigned
+    any_changes = np.any(color_diff != 0, axis=2) # all pixels that changed
+
+    # std match, 115/1.5 #ebda78 (score: 1938)
+    color_match = match_color_grades_std(color_diff, np.array([235, 218, 120]), min_pixel_value=105, tolerance=1.5)
+    color_score = np.mean(color_diff, axis=2) * color_match
+    color_score /= np.max(color_score)
+    
+    progress_log(f'Convolving...')
+    convolved_match = box_blur(color_score, 3).squeeze()
+    threshold = 0.17
+    filtered_match = convolved_match > threshold
+
+    color_match_old = match_color_grades(color_diff, loot_particles_base_color, min_pixel_value=120, tolerance=10)
+    progress_log(f'Convolving...')
+    threshold = 0.5
+    filtered_match_old = box_blur(color_match_old.astype(float), 5).squeeze() > threshold
+
+    # if static_loot_general_var % 2 == 1:
+    #     color_match_pos = match_color_grades(pos_diff, loot_particles_base_color, min_pixel_value=120, tolerance=10)
+    #     color_match_neg = match_color_grades(neg_diff, loot_particles_base_color, min_pixel_value=120, tolerance=10)
+    # else:
+    #     color_match_pos = match_color_grades(pos_diff, general_loot_diff_color, min_pixel_value=1, tolerance=10000)
+    #     color_match_neg = match_color_grades(neg_diff, general_loot_diff_color, min_pixel_value=1, tolerance=10000)
+     #color_match_cum = color_match_pos | color_match_neg
+
+    # color_score_pos = (np.mean(pos_diff, axis=2) * color_match_pos).astype(np.uint8)
+    # color_score_neg = (np.mean(neg_diff, axis=2) * color_match_neg).astype(np.uint8)
+
+    # color_score = (color_score_pos.astype(float) + color_score_neg.astype(float)) / 2
+    # color_score = color_score ** 2
+
+    while True:
+        get_do()[:,:,:3] = frame1
+        get_do()[:,:,3] = 255
+        sleep(0.8)
+        progress_log('Cumulative diffs:')
+        get_do()[:,:,:3] = unsigned_color_diff
+        get_do()[:,:,3] = 255
+        sleep(1.5)
+        progress_log('Color match results (new):')
+        get_do()[:,:,:3] = frame1 # overwrite on top of original frame for nice visuals ^^
+        get_do()[:,:,1] = 255 * color_match
+        # get_do()[:,:,0] = 255 * (any_changes[0] & ~color_matches_cum[0])
+        get_do()[:,:,0] //= 2
+        get_do()[:,:,2] = 0
+        get_do()[:,:,3] = 255
+        sleep(1.5)
+        progress_log('Matches scores:')
+        get_do()[:,:,0] = (255 * color_score).astype(np.uint8)
+        get_do()[:,:,1] = (255 * color_score).astype(np.uint8)
+        get_do()[:,:,2] = (255 * color_score).astype(np.uint8)
+        sleep(3.5)
+        # break
+        #           progress_log('Filtered matches:')
+        #           get_do()[:,:,1] = 255 * filtered_match
+        #           get_do()[:,:,0] = 255 * (color_match_cum & ~filtered_match)
+        #           get_do()[:,:,3] = 255
+        #           sleep(2.5)
+
+        progress_log('Filtered results (discrete):')
+        get_do()[:,:,:3] = frame1 # overwrite on top of original frame for nice visuals ^^
+        get_do()[:,:,1] = 255 * filtered_match_old
+        get_do()[:,:,0] //= 2
+        get_do()[:,:,2] = 0
+        get_do()[:,:,3] = 255
+        sleep(2.5)
+        progress_log('Filtered results (float):')
+        get_do()[:,:,:3] = frame1 # overwrite on top of original frame for nice visuals ^^
+        get_do()[:,:,1] = 255 * filtered_match
+        get_do()[:,:,0] //= 2
+        get_do()[:,:,2] = 0
+        get_do()[:,:,3] = 255
+        sleep(2.5)
+
+        # break
+
+@print_durations()
+def new_detect_loot_corpse_debug(scan_bounds, grab_screen_func):
+    search_iterations = 2
+    search_interval = 0.000001 # 1 / 8 # 8 fps
     progress_log(f'Loot collection start: {search_iterations} frames at {1 / search_interval} FPS')
+    if True:
+        reset_mock_frame_index()
     
     # collect frame data
     frames = []
     for x in slow_loop(interval=search_interval, max_iter_count=search_iterations):
-        frames.append(grab_screen_func(central_room.get_bbox()))
-        debug_log_image(frames[-1], f'loot-collection-frame-{x}')
+        frames.append(grab_screen_func(scan_bounds.get_bbox()))
+        # debug_log_image(frames[-1], f'loot-collection-frame-{x}')
 
     # for i in range(search_iterations):
     #     debug_log_image(frames[i], f'loot-frame-{i}')
 
     progress_log(f'Frames collected, computing...')
+    # frames = frames[::4] # space out frames in time
+    progress_log(f'Stripping frames...')
 
-    color_diffs = [np.abs(x.astype(int) - y).astype(np.uint8) for x, y in zip(frames[:-1], frames[1:])] # colorful diffs
-    any_changes = np.sum([np.any(x > 0, axis=2) for x in color_diffs], axis=0) > 0 # mask where at least one pixel changed
-    # not `scores` anymore but ok
-    scores = [match_color_tone(x, loot_particles_base_color, min_pixel_value=100, tolerance=10) for x in color_diffs] # scores for loot detection
 
-    # debug snippet
-    if False: # does not work for non-fullscreen capture
-        get_do()[:, :, 3] = 255
-        for i in range(len(color_diffs)):
-            progress_log(f'showing diff #{i + 1}')
-            get_do()[:, :, :3] = color_diffs[i]
-            sleep(2.5)
-            progress_log(f'showing scores')
-            get_do()[:, :, 0] = scores[i] * 255
-            get_do()[:, :, 1] = scores[i] * 255
-            get_do()[:, :, 2] = 0
-            sleep(2.5)
-    # debug snippet
 
-    matches = [match_cont_color(x, corpse_particles_base_color, corpse_color_detection_threshold) for x in color_diffs] # matches for corpse detection
-    # pos_matches = np.sum(scores, axis=0) * any_changes > 0 # pixels that match loot
-    pos_matches = np.sum(scores, axis=0) * any_changes > 0 # pixels that match loot
-    neg_matches = any_changes ^ pos_matches # pixels that don't match loot
-    s_scores = pos_matches.astype(int) - neg_matches.astype(int) # combination of last 2
-    for x, y in zip(matches, color_diffs): x[np.all(y == 0, axis=2)] = 0 # filter matches (?)
-    cum_match = np.sum(matches, axis=0) > 0 # cumulative matches
-    # get_do()[:,:,0] = 255 * neg_matches
-    # get_do()[:,:,2] = 255 * pos_matches
-    # get_do()[:,:,3] = 255 * any_changes
+    color_diffs = [x.astype(int) - y for x, y in zip(frames[:-1], frames[1:])] # colorful signed diffs
+    pos_diffs = [np.clip(x, 0, 255).astype(np.uint8) for x in color_diffs] # only positive changes
+    neg_diffs = [(- np.clip(x, -255, 0)).astype(np.uint8) for x in color_diffs] # only negative changes
+    unsigned_color_diffs = [np.abs(x).astype(np.uint8) for x in color_diffs] # color_diffs but unsigned
+    any_changes = [np.any(x != 0, axis=2) for x in color_diffs] # all pixels that changed
 
+    # color_matches = [match_cont_color(x, corpse_particles_base_color, corpse_color_detection_threshold) for x in unsigned_color_diffs]
+    # color_matches_pos = [match_cont_color(x, corpse_particles_base_color, corpse_color_detection_threshold) for x in pos_diffs]
+    # color_matches_neg = [match_cont_color(x, corpse_particles_base_color, corpse_color_detection_threshold) for x in neg_diffs]
+    color_matches = [match_color_grades(x, corpse_particles_base_color, min_pixel_value=80, tolerance=15) for x in unsigned_color_diffs]
+    # color_matches_pos = [match_color_grades(x, corpse_particles_base_color, min_pixel_value=80, tolerance=15) for x in pos_diffs]
+    # color_matches_neg = [match_color_grades(x, corpse_particles_base_color, min_pixel_value=80, tolerance=15) for x in neg_diffs]
+    # color_matches_cum = [x | y for x, y in zip(color_matches_pos, color_matches_neg)]
+
+    progress_log(f'Convolving...') # NOT MATCHES, IT IS A SINGLE ONE RIGHT NOW FIXXXX
+    convolved_matches = box_blur(color_matches[0].astype(float), 5).squeeze()
+    threshold = 0.9
+    filtered_matches = convolved_matches > threshold
+
+    while True:
+        get_do()[:,:,:3] = frames[0]
+        get_do()[:,:,3] = 255
+        sleep(1)
+        get_do()[:,:,:3] = frames[1]
+        get_do()[:,:,3] = 255
+        sleep(1)
+        progress_log('Positive diffs:')
+        get_do()[:,:,:3] = pos_diffs[0]
+        get_do()[:,:,3] = 255
+        sleep(1.5)
+        progress_log('Negative diffs:')
+        get_do()[:,:,:3] = neg_diffs[0]
+        get_do()[:,:,3] = 255
+        sleep(1.5)
+        progress_log('Cumulative diffs:')
+        get_do()[:,:,:3] = unsigned_color_diffs[0]
+        get_do()[:,:,3] = 255
+        sleep(0.8)
+        progress_log('Color match results:')
+        get_do()[:,:,:3] = frames[0] # overwrite on top of original frame for nice visuals ^^
+        get_do()[:,:,0] //= 2
+        get_do()[:,:,1] = 255 * color_matches[0]
+        get_do()[:,:,2] = 0
+        get_do()[:,:,3] = 255
+        sleep(4)
+        progress_log('Color match results (filtered):')
+        get_do()[:,:,1] = 255 * filtered_matches
+        sleep(4)
+
+@print_durations()
+def detect_loot(scan_bounds, grab_screen_func=None, frames=None):
+    "provide either screen grab function or list of 2 frames"
+    if frames is None:
+        search_iterations = 2
+        search_interval = 0.5 # 1 / 8 # 8 fps
+        progress_log(f'Loot collection start: {search_iterations} frames at {1 / search_interval} FPS')
+
+        # collect frame data
+        frames = []
+        for x in slow_loop(interval=search_interval, max_iter_count=search_iterations):
+            frames.append(grab_screen_func(scan_bounds.get_bbox()))
+            debug_log_image(frames[-1], f'loot-collection-frame-{x}') # do NOT disable counter increment
+        progress_log(f'Frames collected, computing...')
+    
+    frame1, frame2 = frames
+
+    # base computations
+    color_diff = frame1.astype(int) - frame2 # colorful signed diffs
+    unsigned_color_diff = np.abs(color_diff).astype(np.uint8) # color_diffs but unsigned
+    # any_changes = np.any(color_diff != 0, axis=2)
+
+    # general loot
+    color_match = match_color_grades_std(color_diff, np.array([235, 218, 120]), min_pixel_value=105, tolerance=1.5)
+    color_score = np.mean(color_diff, axis=2) * color_match
+    color_score /= np.max(color_score)
+    
     progress_log(f'Convolving...')
-    kernel_size = 11
-    threshold = 0.75
-    smoothed = convolve2d(cum_match.astype(int), np.ones((kernel_size, kernel_size)), mode='same')
-    filtered_mask = smoothed > kernel_size * kernel_size * threshold
+    convolved_match_general = box_blur(color_score, 3).squeeze()
+    threshold = 0.17
+    filtered_match_general = convolved_match_general > threshold
 
-    progress_log(f'Detecting fragments...')
+    # corpse loot
+    color_match_corpse = match_color_grades(unsigned_color_diff, corpse_particles_base_color, min_pixel_value=80, tolerance=15)
 
-    loot_frags, _, _, loot_frag_mask = detect_fragments(s_scores.reshape(*s_scores.shape, 1), s_scores != 0, masked_patch=True)
-    corpse_frags, _, _, corpse_frag_mask = detect_fragments(filtered_mask, filtered_mask)
+    progress_log(f'Convolving...') # NOT MATCHES, IT IS A SINGLE ONE RIGHT NOW FIXXXX
+    convolved_match_corpse = box_blur(color_match_corpse.astype(float), 5).squeeze()
+    threshold = 0.9
+    filtered_match_corpse = convolved_match_corpse > threshold
 
-    for i in range(len(corpse_frags))[::-1]:
-        if corpse_frags[i].point_count < corpse_min_fragment_pixels:
-            progress_log(f'Discarded corpse candidate: not enough pixels: {corpse_frags[i].bounds}')
-            del corpse_frags[i]
+    # collection (?)
+    filtered_matches = filtered_match_general | filtered_match_corpse
 
-    for fragment in loot_frags[:]: # copy list
-        fragment_val = np.mean(fragment.masked_patch)
-        if fragment_val < 0: 
-            loot_frags.remove(fragment)
-            continue
-        # progress_log(f'Fragment: {fragment.bounds}, value: {fragment_val}')
+    loot_coords = []
+    grid_size = 10 # let's say 1080p => 10x10 grid (~20k pixels per cell)
+    while scan_bounds.area / (grid_size * grid_size) < 30000: grid_size -= 1
+    point_color = get_debug_color(randrange(10))
+    for y in range(grid_size):
+        for x in range(grid_size):
+            start_pos = (int(x * scan_bounds.width / grid_size), int(y * scan_bounds.height / grid_size))
+            end_pos = (int((x + 1) * scan_bounds.width / grid_size), int((y + 1) * scan_bounds.height / grid_size))
+            cell_bounds = Bounds(*start_pos, *end_pos)
+            cell_patch = filtered_matches[cell_bounds.to_slice()]
+            ys, xs = cell_patch.nonzero()
+            if len(xs) == 0: continue
 
-        draw_border(get_do(), fragment.bounds.offset(central_room.low_pos), get_debug_color(randrange(10)), 1)
+            draw_border(get_do(), cell_bounds.offset(scan_bounds.low_pos), np.array([0, 200, 40, 255]), thickness=3)
 
-    groups = group_fragments(loot_frags, general_loot_particle_search_radius)
-    group_bounds = [Bounds.from_points(*[y for x in group for y in x.bounds.get_corners()]) for group in groups]
+            click_index = randrange(0, len(xs))
+            target_pos = np.array([xs[click_index], ys[click_index]]) + scan_bounds.low_pos + start_pos
 
-    progress_log(f'Grouped fragments: {len(groups)} groups')
+            draw_disk(get_do(), np.array(target_pos), 7, point_color)
+            loot_coords.append(target_pos)
+            result_log(f'Detected loot candidate at cell {x + 1}; {y + 1}')
 
-    filtered_groups = []
-    for i, group in enumerate(groups):
-        if group_bounds[i].are_smaller_than(loot_min_size):
-            progress_log(f'Discarding too small group: {group_bounds[i]}')
-            continue
-        else:
-            filtered_groups.append(group_bounds[i].offset(central_room.low_pos))
-        
-        # for fragment in group:
-        #     get_do()[fragment.bounds.to_slice(offset=central_room.low_pos)] = get_debug_color(i)
-
-        draw_border(get_do(), group_bounds[i].offset(central_room.low_pos), np.array([28, 125, 199, 255]), 3)
-
-    for fragment in corpse_frags:
-        if fragment.bounds.are_smaller_than(corpse_min_fragment_size):
-            progress_log(f'Discarding corpse candidate: {fragment.bounds}')
-            continue
-        else:
-            filtered_groups.append(fragment.bounds.offset(central_room.low_pos))
-
-        draw_border(get_do(), fragment.bounds.offset(central_room.low_pos), np.array([255, 0, 0, 255]), 3)
-
-    return filtered_groups
+    return loot_coords
 
 def is_room_click_diff(diff: np.ndarray):
     "Given the diff of the room, determine whether the room was clicked or not"
@@ -443,3 +571,14 @@ def detect_ui(pixels):
     have_patch3 = np.sum(match_color_exact(bottom_right_patch, ui_primary_color)) > ui_minimal_pixel_count
 
     return have_patch1 and have_patch2 and have_patch3
+
+def detect_character_panel(pixels):
+    "detect the character panel that pops up on the left when you click a character"
+    dh = int(pixels.shape[0] * 0.1) # get pixels from 10% to 90% vertically
+    width = int(pixels.shape[1] * 0.25) # get pixels from 0% to 25% horizontally
+
+    panel_pixels = pixels[dh:-dh, 0:width]
+    low_color_count = np.sum(match_color_exact(panel_pixels, character_panel_low_color))
+    high_color_count = np.sum(match_color_exact(panel_pixels, ui_primary_color))
+
+    return low_color_count >= character_panel_min_low_pixels and high_color_count >= character_panel_min_high_pixels

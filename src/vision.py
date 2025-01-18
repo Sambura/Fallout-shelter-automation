@@ -40,7 +40,9 @@ def get_mock_frames(): return mock_frames
 def load_mock_frames(path, mode='frames'):
     frames = []
 
-    for filename in os.listdir(path):
+    # filenames should have format (\d+)-.*?\.(png|jpg)
+    # example: 102-mock-frame.png
+    for filename in sorted(os.listdir(path), key=lambda x: int(x.split('-')[0])):
         if filename.endswith(".jpg") or filename.endswith(".png"):
             img_path = os.path.join(path, filename)
             img = Image.open(img_path)
@@ -182,6 +184,7 @@ class Bounds:
         return Bounds(self.x_min + x, self.y_min + y, self.x_max + x, self.y_max + y)
 
     def offset_bounds(self, *offsets):
+        "This is more of shrink / expand function then offset"
         if len(offsets) == 1:
             v = offsets[0]
             return Bounds(self.x_min - v, self.y_min - v, self.x_max + v, self.y_max + v)
@@ -291,9 +294,11 @@ def match_color_fuzzy(pixels, color, max_deviation):
     "Simple fuzzy matcher, matches any pixels that are up to `max_deviation` far from `color`"
     return np.sum(np.abs(pixels - color), axis=2) <= max_deviation
 
-def match_color_tone(pixels, color, min_pixel_value=0, tolerance=0):
+def match_color_grades(pixels, color, min_pixel_value=0, tolerance=0):
     """
     Allows to match any pixels that have the same tone as `color` (e.g. `color` or darker)
+    NOTE: this function is primarily suited to match RGB multiples of the specified color, rather than the actual color tone.
+    consider using `match_color_hue` if you need a more general mather
     Use `min_pixel_value` to mask all pixels that are too dark. This is the min value of r+g+b of pixel
     Tolerance controls how close the color tone should be to the `color` to match
     """
@@ -303,6 +308,27 @@ def match_color_tone(pixels, color, min_pixel_value=0, tolerance=0):
     recolor = color_grads.reshape(*color_grads.shape, 1) * color.reshape(1, -1)
     deviations = np.sum(np.abs(pixels - recolor), axis=2)
     return (deviations <= tolerance) * mask
+
+def match_color_grades_std(pixels, color, min_pixel_value=0, tolerance=0):
+    """
+    Allows to match any pixels that have the same tone as `color` (e.g. `color` or darker)
+    Use `min_pixel_value` to mask all pixels that are too dark. This is the min value of r+g+b of pixel
+    Tolerance controls how close the color tone should be to the `color` to match
+    """
+    pixel_values = np.sum(pixels, axis=2)
+    mask = pixel_values >= min_pixel_value
+    deviations = np.std(pixels.astype(float) / color, axis=2)
+    return (deviations <= tolerance / 100) * mask
+
+def _match_color_hue(pixels, target_hue, min_pixel_value=0, tolerance=0):
+    pixel_values = np.sum(pixels, axis=2)
+    mask = pixel_values >= min_pixel_value
+    hues = cv2.cvtColor(pixels, cv2.COLOR_RGB2HSV)[:,:,0]
+    return (np.abs(hues - target_hue) <= tolerance) & mask
+
+def match_color_hue(pixels, color, min_pixel_value=0, tolerance=0):
+    target_hue = cv2.cvtColor(color.reshape(1, 1, -1), cv2.COLOR_RGB2HSV)[:,:,0]
+    return _match_color_hue(pixels, target_hue, min_pixel_value, tolerance)
 
 def match_cont_color_values(pixels, color):
     color_grads = np.mean(pixels.astype(float) / color, axis=2)
@@ -342,11 +368,14 @@ def detect_blending_pixels(pixels, primary_color, secondary_color, max_blending=
 
     return np.logical_or(masked_results, close_pixels) # restore cut off pixels close to endpoints 
 
-def is_fragment_rectangular(fragment: Fragment, report_fraction=False):
-    if fragment.bounds.area == 0: return None
-    if not hasattr(fragment, 'patch_mask'): fragment.compute(patch_mask=True)
+def get_vertical_scanline_fraction(patch_mask, scanline):
+    return np.mean(patch_mask[:, scanline])
 
-    rect_mask = np.ones(fragment.bounds.shape, dtype=bool)
+def get_horizontal_scanline_fraction(patch_mask, scanline):
+    return np.mean(patch_mask[scanline, :])
+
+def _is_fragment_rectangular(patch_mask):
+    rect_mask = np.ones(patch_mask.shape, dtype=bool)
     rect_mask[1:-1, 1:-1] = False
 
     # same as np.sum(rect_mask)
@@ -354,14 +383,26 @@ def is_fragment_rectangular(fragment: Fragment, report_fraction=False):
         mask_ones_count = rect_mask.shape[0] + rect_mask.shape[1] - 1
     else:
         mask_ones_count = 2 * (rect_mask.shape[0] + rect_mask.shape[1] - 2)
-    mask_ones_count2 = np.sum(rect_mask)
+    mask_ones_count2 = np.sum(rect_mask) # probably can be removed
     if mask_ones_count != mask_ones_count2: raise 'wtf'
 
-    matching_pixels = np.sum(np.logical_and(fragment.patch_mask, rect_mask))
-    matching_fraction = matching_pixels / mask_ones_count
+    matching_pixels = np.sum(np.logical_and(patch_mask, rect_mask))
+ 
+    return matching_pixels / mask_ones_count
+
+def is_fragment_rectangular(fragment: Fragment, report_fraction=False):
+    if fragment.bounds.area == 0: return None
+    if not hasattr(fragment, 'patch_mask'): fragment.compute(patch_mask=True)
+
+    matching_fraction = _is_fragment_rectangular(fragment.patch_mask)
  
     if report_fraction: return matching_fraction == 1, matching_fraction
     return matching_fraction == 1
+
+def strip_rectangular_fragment(fragment: Fragment, min_side_fill_fraction):
+    """Tries to make a fragment more rectangular, but certainly is not universal,
+    do not expect this to work for your usecase"""
+    raise Exception('I changed my mind, not gonna implement this')
 
 def compute_img_diff_ratio(img1, img2):
     "computes fraction of differing pixels between two images"

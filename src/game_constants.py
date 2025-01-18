@@ -2,7 +2,7 @@ import numpy as np
 
 # Rooms detection
 undiscoveredRoomColor = np.array([0, 0, 0])
-undiscovered_room_color_max_deviation = 15
+undiscovered_room_color_max_deviation = 15 # why is that here again?
 undiscovered_room_border_mean_color = np.array([0, 220, 0])
 undiscovered_room_border_color_max_deviation = 40
 min_room_match = 0.7
@@ -66,6 +66,33 @@ general_loot_particle_colors_deviation = 60
 general_loot_particle_search_radius = 40
 loot_min_size = 9
 
+# new loot detection
+general_loot_diff_color = np.array([126, 114, 64]) # 280 pix (10 / 80)
+general_loot_diff_color2 = np.array([252 // 2, 214 // 2, 133 // 2])
+# #e4d077 - 274 pix
+# max reached: 276 (#ccb96c
+# 594 (general_loot_diff_color  )
+# 840 (253, 240, 137)
+# hue 19, tolerance 15
+
+# test series:::
+# std match, 115/3, #71693a (score: 1931)
+# std match, 115/2.5 #8d8348 (score: 1936)
+# std match, 115/2.25 #9a8f4f (score: 1938)
+# std match, 115/2, #aea259 (score: 1935)
+# std match, 115/1.75 #ccbe68 (score: 1933)
+# std match, 115/1.6 #e4d574 (score: 1937)
+# std match, 115/1.5 #ebda78 (score: 1938)
+# std match, 115/1 #fee882 (score: 1694)
+
+# std, 115/15 #9c974c (score: 1373)
+# std, 115/10 #f5e479 (score: 1789)
+# std, 115/9  #4e4927 (score: 1831)
+# std, 115/8  #d6c66c (score: 1868)
+# std, 115/7  #ad9e57 (score: 1823)
+# std, 115/5  #d4c46e (score: 1413)
+
+
 corpse_particles_base_color = np.array([255, 234, 153])
 corpse_min_fragment_pixels = 300
 corpse_min_fragment_size = 35
@@ -73,3 +100,7 @@ corpse_color_detection_threshold = 0.5
 
 ui_primary_color = np.array([18, 255, 21])
 ui_minimal_pixel_count = 50
+
+character_panel_low_color = np.array([0, 119, 1])
+character_panel_min_high_pixels = 50000
+character_panel_min_low_pixels = 15000
