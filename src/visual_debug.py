@@ -13,7 +13,7 @@ def clear_debug_canvas():
     debug_output *= 0
 
 def combined_debug_frames():
-    return combine_images_alpha_mixing(debug_frames)
+    return combine_images_alpha_mixing(debug_frames) if len(debug_frames) > 0 else 0
 
 def override_debug_frame_shape(new_shape):
     global screen_shape, debug_frames, debug_output

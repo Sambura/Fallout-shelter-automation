@@ -63,3 +63,9 @@ def truncate_log():
 
 def get_current_log(lines=60):
     return '\n'.join(current_log[-lines:])
+
+def set_debug_log_images_enabled(enabled=True, verbose=True):
+    global debug_log_images
+    debug_log_images = enabled
+    if verbose:
+        progress_log(f'{"Enabled" if enabled else "Disabled"} debug image logging')

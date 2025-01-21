@@ -40,11 +40,10 @@ class MatchFunctionEntry:
         self.arg_restrictions = arg_restrictions
 
 class Slider:
-    def __init__(self, parent, label_text, range_, row, update_callback, is_integer):
+    def __init__(self, parent, label_text, range_, update_callback, is_integer):
         self.frame = ttk.Frame(parent)
-        self.frame.grid(row=row, column=0, pady=5, sticky="ew")
 
-        self.var = tk.IntVar() if is_integer else tk.DoubleVar()
+        self.var = tk.IntVar(value=range_[0]) if is_integer else tk.DoubleVar(value=range_[0])
         self.label = ttk.Label(self.frame, text=f"{label_text}:")
         self.label.grid(row=0, column=0, padx=5, sticky="ew")
 
@@ -132,9 +131,6 @@ class PixelMatcherApp:
         # Load the initial image and update the display
         self.set_source_image(mpimg.imread(image_path))
 
-        # Load and process the modifier image
-        self.set_modifier_image(modifier_image_path)
-
         # Create a frame for interactive elements
         self.interactive_frame = ttk.Frame(root)
         self.interactive_frame.grid(row=0, column=1, sticky="nsew")
@@ -187,6 +183,14 @@ class PixelMatcherApp:
         self.match_ext_info_label = ttk.Label(self.interactive_frame, text="match_ext_info_label")
         self.add_interactive_widget(self.match_ext_info_label)
 
+        self.positive_modifier_factor_slider = Slider(self.interactive_frame, 'Positive factor', (0, 25), self.update_modifier_image, is_integer=False)
+        self.add_interactive_widget(self.positive_modifier_factor_slider.frame)
+        self.positive_modifier_factor_slider.var.set(1)
+
+        self.negative_modifier_factor_slider = Slider(self.interactive_frame, 'Negative factor', (0, 25), self.update_modifier_image, is_integer=False)
+        self.add_interactive_widget(self.negative_modifier_factor_slider.frame)
+        self.negative_modifier_factor_slider.var.set(1)
+
         self.best_color_match_label = ttk.Label(self.interactive_frame, text="<color jitter result>")
         self.add_interactive_widget(self.best_color_match_label)
 
@@ -204,7 +208,7 @@ class PixelMatcherApp:
         def on_jitter_button_click():
             if not self.jitter_in_progress:
                 self.jitter_in_progress = True
-                self.max_match_score = 0
+                self.max_match_score = -2000000000
                 self.temperature = 750
 
                 # set the first color argument in the list
@@ -238,7 +242,18 @@ class PixelMatcherApp:
         self.jitter_in_progress = False
         self.interactive_collapsed = False
 
+        # Load and process the modifier image
+        self.set_modifier_image(modifier_image_path)
         # Calculate match
+        self.update_match()
+
+    def update_modifier_image(self):
+        positive_mask = self.base_modifier_image > 0
+        negative_mask = self.base_modifier_image < 0
+        positive_part = self.base_modifier_image * positive_mask * self.positive_modifier_factor_slider.get_value()
+        negative_part = self.base_modifier_image * negative_mask * self.negative_modifier_factor_slider.get_value()
+        self.modifier_image = positive_part + negative_part
+
         self.update_match()
 
     def toggle_interactive_frame(self):
@@ -271,9 +286,9 @@ class PixelMatcherApp:
         print(f'New color: {color_hex}, match score: {self.modified_match_score}, max reached: {self.max_match_score} ({self.maxed_color[1]}), T: {self.temperature:0.1f} K')
 
         if self.temperature > 10:
-            self.temperature *= 0.999
+            self.temperature *= 0.998
         else:
-            self.temperature *= 0.997
+            self.temperature *= 0.996
 
         if self.temperature > 0.5:
             self.root.after(5, self.do_jitter_color)
@@ -282,7 +297,7 @@ class PixelMatcherApp:
             self.jitter_in_progress = False
 
     def set_source_image(self, new_image):
-        self.source_image = (new_image * 255).astype(np.uint8)
+        self.source_image = (new_image * 255).astype(np.uint8)[:,:,:3]
         self.update_image(self.source_image)
 
     def set_modifier_image(self, modifier_image_path):
@@ -292,9 +307,10 @@ class PixelMatcherApp:
                 raise ValueError("Modifier image dimensions do not match source image dimensions.")
             red_channel = modifier_image[:, :, 0] # negative channel, 255 == -1, 254 == -2, ..., 0 == 0
             green_channel = modifier_image[:, :, 1] # positive channel, 255 == 1, 254 == 2, ..., 0 == 0
-            self.modifier_image = ((256 - 255 * green_channel) % 256 - (256 - 255 * red_channel) % 256).astype(int)
+            self.base_modifier_image = ((256 - 255 * green_channel) % 256 - (256 - 255 * red_channel) % 256).astype(int)
         else:
-            self.modifier_image = np.ones_like(self.source_image[:, :, 0], dtype=int)
+            self.base_modifier_image = np.ones_like(self.source_image[:, :, 0], dtype=int)
+        self.update_modifier_image()
 
     def update_image(self, new_image):
         self.ax.clear()  # Clear the current plot
@@ -325,11 +341,13 @@ class PixelMatcherApp:
         row = self.next_interactive_row
         for arg_name, arg_type, arg_range in selected_match_function.arg_restrictions:
             if arg_type == 'int_slider':
-                element = Slider(self.interactive_frame, arg_name, arg_range, row, self.update_match, is_integer=True)
+                element = Slider(self.interactive_frame, arg_name, arg_range, self.update_match, is_integer=True)
+                element.frame.grid(row=row, column=0, pady=5, sticky="ew")
                 self.additional_ui_elements.append(element)
                 row += 1  # Move to the next set of rows
             elif arg_type == 'float_slider':
-                element = Slider(self.interactive_frame, arg_name, arg_range, row, self.update_match, is_integer=False)
+                element = Slider(self.interactive_frame, arg_name, arg_range, self.update_match, is_integer=False)
+                element.frame.grid(row=row, column=0, pady=5, sticky="ew")
                 self.additional_ui_elements.append(element)
                 row += 1  # Move to the next set of rows
             elif arg_type == 'color_picker':

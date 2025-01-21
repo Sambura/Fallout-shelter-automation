@@ -3,6 +3,7 @@ from .debug import result_log
 from PIL import ImageGrab, Image
 from scipy.signal import convolve2d
 import matplotlib.pyplot as plt
+from pathlib import Path
 import numpy as np
 import cv2
 import os
@@ -17,25 +18,29 @@ def pil_screen_capture(bbox):
     if bbox is not None: bbox = [bbox[0], bbox[1], bbox[2] + 1, bbox[3] + 1]
     return np.array(ImageGrab.grab(bbox))
 
-mock_frames = None
-mock_index = 0
-mock_mode = None
+_mock_directory = None
+_mock_frame_paths = []
+_current_mock_path_index = 0
+
+_mock_frames = None
+_mock_index = 0
+_mock_mode = None
 
 __capture_func = pil_screen_capture
 __finish_func = None
 
 def reset_mock_frame_index():
-    global mock_index
-    mock_index = 0
+    global _mock_index
+    _mock_index = 0
 
 # frames / fixed mode
 def set_mock_frames(frames, mode='frames'):
-    global mock_frames, mock_mode
-    mock_frames = frames
-    mock_mode = mode
+    global _mock_frames, _mock_mode
+    _mock_frames = frames
+    _mock_mode = mode
     reset_mock_frame_index()
 
-def get_mock_frames(): return mock_frames 
+def get_mock_frames(): return _mock_frames 
 
 def load_mock_frames(path, mode='frames'):
     frames = []
@@ -43,7 +48,7 @@ def load_mock_frames(path, mode='frames'):
     # filenames should have format (\d+)-.*?\.(png|jpg)
     # example: 102-mock-frame.png
     for filename in sorted(os.listdir(path), key=lambda x: int(x.split('-')[0])):
-        if filename.endswith(".jpg") or filename.endswith(".png"):
+        if filename.endswith(('.jpg', '.png')):
             img_path = os.path.join(path, filename)
             img = Image.open(img_path)
             img_array = np.array(img)
@@ -52,25 +57,54 @@ def load_mock_frames(path, mode='frames'):
     print(f'Loaded {len(frames)} mock frames')
     set_mock_frames(frames, mode)
 
+def _is_frame_dir(path):
+    return len([x for x in os.listdir(path) if x.endswith(('.jpg', '.png'))]) > 0
+
+def set_mock_frames_path(path, load_frames=True, load_mode='frames'):
+    global _mock_directory, _mock_frame_paths, _current_mock_path_index
+    has_images = _is_frame_dir(path)
+    if has_images:
+        _mock_directory = Path(path).parent
+        _mock_frame_paths = [path]
+    else:
+        children = [os.path.join(path, x) for x in os.listdir(path)]
+        _mock_frame_paths = [x for x in children if os.path.isdir(x) and _is_frame_dir(x)]
+
+    _current_mock_path_index = 0
+    if len(_mock_frame_paths) == 0:
+        raise Exception(f'Could not find mock frame directories in {path}')
+
+    if load_frames:
+        load_mock_frames(_mock_frame_paths[_current_mock_path_index], load_mode)
+
+def load_next_mock_path(previous=False):
+    global _current_mock_path_index
+    _current_mock_path_index = (_current_mock_path_index + (-1 if previous else 1)) % len(_mock_frame_paths)
+    load_mock_frames(_mock_frame_paths[_current_mock_path_index], _mock_mode)
+    return _mock_frame_paths[_current_mock_path_index]
+
+def get_current_mock_path():
+    return _mock_frame_paths[_current_mock_path_index]
+
 def crop_image(image, bbox):
     "Crops image. This is what used for cropping screen grabs"
     if bbox is None: return image
     return image[bbox[1]:bbox[3]+1, bbox[0]:bbox[2]+1]
 
 def grab_mock_screen(bbox=None):
-    global mock_index
-    index = mock_index
-    if mock_mode != 'fixed': mock_index += 1
-    return crop_image(mock_frames[index].copy(), bbox)
+    global _mock_index
+    index = _mock_index
+    if _mock_mode != 'fixed': _mock_index += 1
+    return crop_image(_mock_frames[index].copy(), bbox)
 
-def init_screen_capture(mode='real', window_title=None, mock_directory=None, mock_mode='frames', use_native=True):
+def init_screen_capture(mode='real', window_title=None, mock_directory=None, _mock_mode='frames', use_native=True):
     """Performs necessary initializations for screen/window capture.
 
     Parameters:
         mode (str): either 'real' for capturing actual screen or 'mock' for mocking screen capture
         window_title (str): should be specified if 'real' mode is selected - window title to be captured
         mock_directory (str): may be specified if 'mock' mode is selected - path to directory with mock frames
-        mock_mode (str): 'frames' for mock screen capture to return all found frames sequentially, or 'fixed' to return the first frame every time
+        _mock_mode (str): 'frames' for mock screen capture to return all found frames sequentially, or 'fixed' to return the first frame every time
         use_native (bool): set to False to use generic capture function even if native is available (only for mode == 'real')
     
     Returns: a tuple (func, bool) with a function to be used for screen capture (with optional bbox parameter); and bool indicating whether 
@@ -98,10 +132,10 @@ def init_screen_capture(mode='real', window_title=None, mock_directory=None, moc
         print('Warning: capture function set to mock')
         
         __capture_func = grab_mock_screen
-        native_capture = True
+        native_capture = False
 
         if mock_directory is not None:
-            load_mock_frames(mock_directory, mock_mode)
+            set_mock_frames_path(mock_directory, load_mode=_mock_mode)
     else:
         raise Exception('mode should be `real` or `mock`')
 
