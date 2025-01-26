@@ -1,7 +1,7 @@
 import numpy as np
 
 # Rooms detection
-undiscoveredRoomColor = np.array([0, 0, 0])
+undiscovered_room_color = np.array([0, 0, 0])
 undiscovered_room_color_max_deviation = 15 # why is that here again?
 undiscovered_room_border_mean_color = np.array([0, 220, 0])
 undiscovered_room_border_color_max_deviation = 40

@@ -5,6 +5,7 @@ from .util import rotate_vector_2d
 import numpy as np
 
 def draw_border(pixels: np.ndarray, bounds: Bounds, color: np.ndarray, thickness=1):
+    "Make sure pixels have the same or larger data type than color"
     border = np.ones((*bounds.shape, pixels.shape[2]), dtype=pixels.dtype) * color
     h_thickness = min(thickness, (bounds.width - thickness) // 2)
     v_thickness = min(thickness, (bounds.height - thickness) // 2)
@@ -15,13 +16,13 @@ def draw_border(pixels: np.ndarray, bounds: Bounds, color: np.ndarray, thickness
     except:
         progress_log('draw border failed')
 
-def draw_circle(canvas, pos, radius, color):
-    ts = np.linspace(0, 2 * np.pi, int(1.1 * 2 * radius * np.pi))
-    xs = np.round(np.cos(ts) * radius + pos[0]).astype(int)
-    ys = np.round(np.sin(ts) * radius + pos[1]).astype(int)
-
-    for x, y in zip(xs, ys):
-        canvas[y, x] = color
+def draw_circle(canvas, pos, radius, color, thickness=1):
+    x, y = pos
+    yy, xx = np.ogrid[-y:canvas.shape[0] - y, -x:canvas.shape[1] - x]
+    r1 = radius - thickness / 2
+    r2 = radius + thickness / 2
+    mask = (xx**2 + yy**2 <= r2**2) & (xx**2 + yy**2 > r1**2)
+    canvas[mask] = color
 
 def draw_disk(canvas, pos, radius, color):
     x, y = pos

@@ -31,7 +31,7 @@ def detect_rooms(pixels, return_fragments=False):
         bounds = fragment.bounds
 
         total_border = fragment.point_count
-        total_room = np.sum(np.sum(np.abs(fragment.source_patch - undiscoveredRoomColor), axis=2) < undiscovered_room_color_max_deviation)
+        total_room = np.sum(np.sum(np.abs(fragment.source_patch - undiscovered_room_color), axis=2) < undiscovered_room_color_max_deviation)
         match_fraction = (total_border + total_room) / bounds.area
         if match_fraction < min_room_match and total_room > 0:
             progress_log(f'Fragment {fragment.fragment_value} discarded: {("no room found" if total_room <= 0 else f"mismatch [{match_fraction * 100:0.2f}%]")}')
@@ -278,7 +278,6 @@ def detect_structural_rooms(structural: Fragment):
 
     return rooms
 
-static_loot_general_var = 0
 @print_durations()
 def detect_dialogue_buttons(pixels, screen_size):
     create_debug_frame()
@@ -305,141 +304,138 @@ def detect_dialogue_buttons(pixels, screen_size):
 
     return len(detected) > 0, detected
 
-@print_durations()
-def new_detect_loot_general_debug(scan_bounds, grab_screen_func):
-    global static_loot_general_var
-    result_log('[Debug general loot detection]')
-
-    static_loot_general_var += 1
-    
-    # collect frame data
-    frames = []
-    interval = 0 # 0.5
-    reset_mock_frame_index()
-    for x in slow_loop(interval=interval, max_iter_count=2):
-        frames.append(grab_screen_func(scan_bounds.get_bbox()))
-
-    frame1, frame2 = frames
+def compute_loot_masks(frame1, frame2):
     color_diff = frame1.astype(int) - frame2 # colorful signed diffs
     unsigned_color_diff = np.abs(color_diff).astype(np.uint8) # color_diffs but unsigned
     any_changes = np.any(color_diff != 0, axis=2) # all pixels that changed
-    color_score = np.mean(unsigned_color_diff, axis=2)
+    color_score = np.mean(unsigned_color_diff, axis=2) / 255
+
+    return color_diff, unsigned_color_diff, any_changes, color_score
+
+def detect_generic_loot(frame1, frame2, color_diff, unsigned_color_diff, any_changes, color_score):
     frame_color_score = np.mean(frame2, axis=2)
 
     # std match, 115/1.5 #ebda78 (score: 1938)
     color_match = match_color_grades_std(unsigned_color_diff, np.array([235, 218, 120]), min_pixel_value=105, tolerance=1.5)
     color_mismatch = any_changes & (~color_match)
     color_score_biased = color_score * (color_match.astype(int) - color_mismatch.astype(int))
-    color_score_biased /= 255
 
     # brightness filtering
     brightness_filter = box_blur((frame_color_score > 220), 7).squeeze() > 0
-
-    # THE THING! (?)
-    progress_log(f'Convolving LA THINGA')
-    raw_color_match = match_color_grades_std(frame1, np.array([255, 255, 152]), min_pixel_value=180, tolerance=1.4)
-    loot_gate = box_blur(raw_color_match.astype(float), 17).squeeze() > 0.5
     
-    progress_log(f'Convolving...')
     convolved_match = box_blur(color_score_biased, 3).squeeze()
-    threshold = 0.2
-    filtered_match = convolved_match > threshold
+    filtered_match = convolved_match > 0.2
+    # convolved_match = box_blur(color_score_biased, 5).squeeze()
+    # filtered_match = convolved_match > 0.07
 
-    while True:
-        get_do()[:,:,:3] = frame1
-        get_do()[:,:,3] = 255
-        sleep(0.8)
-        progress_log('Cumulative diffs:')
-        get_do()[:,:,:3] = unsigned_color_diff
-        get_do()[:,:,3] = 255
-        sleep(1.5)
-        progress_log('Color match results (new):')
-        get_do()[:,:,:3] = frame1 # overwrite on top of original frame for nice visuals ^^
-        get_do()[:,:,1] = 255 * color_match
-        get_do()[:,:,0] = 255 * (any_changes & ~color_match)
-        get_do()[:,:,0] //= 2
-        get_do()[:,:,2] = 0
-        get_do()[:,:,3] = 255
-        sleep(2)
-        progress_log('Matches scores:')
-        color_score_display = color_score - np.min(color_score)
-        color_score_display /= np.max(color_score_display)
-        get_do()[:,:,0] = (255 * color_score_display).astype(np.uint8)
-        get_do()[:,:,1] = (255 * color_score_display).astype(np.uint8)
-        get_do()[:,:,2] = (255 * color_score_display).astype(np.uint8)
-        sleep(1.5)
-        # progress_log('Filtered results (yellow gate):')
-        # get_do()[:,:,:3] = frame1 # overwrite on top of original frame for nice visuals ^^
-        # get_do()[:,:,0] //= 2
-        # get_do()[:,:,1] = 255 * filtered_match
-        # get_do()[:,:,2] = 255 * loot_gate
-        # get_do()[:,:,3] = 255
-        # sleep(2.5)
-        progress_log('Filtered results (brightness gate):')
-        get_do()[:,:,:3] = frame1 # overwrite on top of original frame for nice visuals ^^
-        get_do()[:,:,0] //= 2
-        get_do()[:,:,1] = 255 * filtered_match
-        get_do()[:,:,2] = 255 * brightness_filter
-        get_do()[:,:,3] = 255
-        sleep(2.5)
-        progress_log('Filtered results (only gated matches):')
-        get_do()[:,:,:3] = frame1 # overwrite on top of original frame for nice visuals ^^
-        get_do()[:,:,0] //= 2
-        get_do()[:,:,1] = 255 * (filtered_match & brightness_filter)
-        get_do()[:,:,2] = 0
-        get_do()[:,:,3] = 255
-        break
-        sleep(4)
+    return {
+        'result': filtered_match & brightness_filter,
+        'frame_color_score': frame_color_score,
+        'color_match': color_match,
+        'color_mismatch': color_mismatch,
+        'color_score_biased': color_score_biased,
+        'brightness_filter': brightness_filter,
+        'convolved_match': convolved_match,
+        'filtered_match': filtered_match
+    }
 
 @print_durations()
-def new_detect_loot_corpse_debug(scan_bounds, grab_screen_func):
-    result_log('[Debug corpse loot detection]')
-    frames = []
-    for x in slow_loop(interval=0, max_iter_count=2):
-        frames.append(grab_screen_func(scan_bounds.get_bbox()))
-        debug_log_image(frames[-1], f'loot-collection-frame-{x}')
+def debug_detect_generic_loot(grab_screen_func=None, frames=None, mock_mode=False):
+    result_log('[Debug generic loot detection]')
+
+    if frames is None:
+        frames = [grab_screen_func() for x in slow_loop(interval=0 if mock_mode else 0.5, max_iter_count=2)]
 
     frame1, frame2 = frames
+    color_diff, unsigned_color_diff, any_changes, color_score = compute_loot_masks(*frames)
+    detection_map = detect_generic_loot(frame1, frame2, color_diff, unsigned_color_diff, any_changes, color_score)
 
-    color_diff = frame1.astype(int) - frame2 # colorful signed diffs
-    unsigned_color_diff = np.abs(color_diff).astype(np.uint8) # color_diffs but unsigned
-    # any_changes = np.any(color_diff != 0, axis=2) # all pixels that changed
+    get_do()[:,:,:3] = frame1
+    get_do()[:,:,3] = 255
+    sleep(0.8)
+    progress_log('Cumulative diffs:')
+    get_do()[:,:,:3] = unsigned_color_diff
+    get_do()[:,:,3] = 255
+    sleep(1.5)
+    progress_log('Color match results (new):')
+    get_do()[:,:,:3] = frame1 # overwrite on top of original frame for nice visuals ^^
+    get_do()[:,:,1] = 255 * detection_map['color_match']
+    get_do()[:,:,0] = 255 * (any_changes & ~detection_map['color_match'])
+    get_do()[:,:,0] //= 2
+    get_do()[:,:,2] = 0
+    get_do()[:,:,3] = 255
+    sleep(2)
+    progress_log('Matches scores:')
+    color_score_display = color_score - np.min(color_score)
+    color_score_display /= np.max(color_score_display)
+    get_do()[:,:,0] = (255 * color_score_display).astype(np.uint8)
+    get_do()[:,:,1] = (255 * color_score_display).astype(np.uint8)
+    get_do()[:,:,2] = (255 * color_score_display).astype(np.uint8)
+    sleep(1.5)
+    progress_log('Filtered results (brightness gate):')
+    get_do()[:,:,:3] = frame1 # overwrite on top of original frame for nice visuals ^^
+    get_do()[:,:,0] //= 2
+    get_do()[:,:,1] = 255 * detection_map['filtered_match']
+    get_do()[:,:,2] = 255 * detection_map['brightness_filter']
+    get_do()[:,:,3] = 255
+    sleep(2.5)
+    progress_log('Filtered results (only gated matches):')
+    get_do()[:,:,:3] = frame1 # overwrite on top of original frame for nice visuals ^^
+    get_do()[:,:,0] //= 2
+    get_do()[:,:,1] = 255 * detection_map['result']
+    get_do()[:,:,2] = 0
+    get_do()[:,:,3] = 255
 
+def detect_corpse_loot(frame1, frame2, color_diff, unsigned_color_diff, any_changes, color_score):
     # 1d1e12 (min value = 15, tolerance = 3)
     color_match = match_color_grades_std(unsigned_color_diff, np.array([29, 30, 18]), min_pixel_value=15, tolerance=3)
     convolved_match = box_blur(color_match.astype(float), 5).squeeze()
-    threshold = 0.9
-    filtered_matches = convolved_match > threshold
+    filtered_match = convolved_match > 0.9
 
-    while True:
-        get_do()[:,:,:3] = frame1
-        get_do()[:,:,3] = 255
-        sleep(1)
-        progress_log('Cumulative diffs:')
-        get_do()[:,:,:3] = unsigned_color_diff
-        get_do()[:,:,3] = 255
-        sleep(1.1)
-        progress_log('Color match results:')
-        get_do()[:,:,:3] = frame1 # overwrite on top of original frame for nice visuals ^^
-        get_do()[:,:,0] //= 2
-        get_do()[:,:,1] = 255 * color_match
-        get_do()[:,:,2] = 0
-        get_do()[:,:,3] = 255
-        sleep(4)
-        progress_log('Color match results (filtered):')
-        get_do()[:,:,0] = frame1[:,:,0] // 2
-        get_do()[:,:,1] = 255 * filtered_matches
-        sleep(4)
+    return {
+        'result': filtered_match,
+        'convolved_match': convolved_match,
+        'color_match': color_match
+    }
+
+@print_durations()
+def detect_loot_corpse_debug(grab_screen_func=None, frames=None, mock_mode=False):
+    result_log('[Debug corpse loot detection]')
+
+    if frames is None:
+        frames = [grab_screen_func() for x in slow_loop(interval=0 if mock_mode else 0.5, max_iter_count=2)]
+
+    frame1, frame2 = frames
+    color_diff, unsigned_color_diff, any_changes, color_score = compute_loot_masks(*frames)
+    detection_map = detect_corpse_loot(frame1, frame2, color_diff, unsigned_color_diff, any_changes, color_score)
+
+    get_do()[:,:,:3] = frame1
+    get_do()[:,:,3] = 255
+    sleep(1)
+    progress_log('Cumulative diffs:')
+    get_do()[:,:,:3] = unsigned_color_diff
+    get_do()[:,:,3] = 255
+    sleep(1.1)
+    progress_log('Color match results:')
+    get_do()[:,:,:3] = frame1 # overwrite on top of original frame for nice visuals ^^
+    get_do()[:,:,0] //= 2
+    get_do()[:,:,1] = 255 * detection_map['color_match']
+    get_do()[:,:,2] = 0
+    get_do()[:,:,3] = 255
+    sleep(4)
+    progress_log('Color match results (filtered):')
+    get_do()[:,:,0] = frame1[:,:,0] // 2
+    get_do()[:,:,1] = 255 * detection_map['result']
 
 # if need optimizations:
-#    with general loot it is probably safe to ignore topmost 10% of the room (and bottom 5% ????)
+#    with generic loot it is probably safe to ignore topmost 10% of the room (and bottom 5% ????)
 #    with corpses it is probably safe to ignore about 1/3 of the top of the room
 @print_durations()
 def detect_loot(scan_bounds, grab_screen_func=None, frames=None):
     "provide either screen grab function or list of 2 frames"
     if frames is None:
         search_iterations = 2
-        search_interval = 0.5 # 1 / 8 # 8 fps
+        search_interval = 0.5
         progress_log(f'Loot collection start: {search_iterations} frames at {1 / search_interval} FPS')
 
         # collect frame data
@@ -453,50 +449,28 @@ def detect_loot(scan_bounds, grab_screen_func=None, frames=None):
             frames = [crop_image(x, scan_bounds.get_bbox()) for x in frames]
     
     frame1, frame2 = frames
+    color_diff, unsigned_color_diff, any_changes, color_score = compute_loot_masks(*frames)
 
-    # base computations
-    color_diff = frame1.astype(int) - frame2 # colorful signed diffs
-    unsigned_color_diff = np.abs(color_diff).astype(np.uint8) # color_diffs but unsigned
-    any_changes = np.any(color_diff != 0, axis=2)
-    color_scores = np.mean(unsigned_color_diff.astype(float), axis=2) / 255
-    frame_color_score = np.mean(frame2, axis=2)
-
-    # general loot
-    color_match_general = match_color_grades_std(unsigned_color_diff, np.array([235, 218, 120]), min_pixel_value=105, tolerance=1.5)
-    color_mismatch_general = any_changes & (~color_match_general)
-    color_scores_general = color_scores * (color_match_general.astype(int) - color_mismatch_general.astype(int))
-    # only match pixels if there is a nearby pixel with high brightness (in raw frame)
-    brightness_filter = box_blur((frame_color_score > 220), 7).squeeze() > 0
-
-    # loot gate analyzes frame for yellow color, and removes matches if too much yellow is detected (fixes at least one bug)
-    # raw_color_match_general = match_color_grades_std(frame1, np.array([255, 255, 152]), min_pixel_value=180, tolerance=1.4)
-    # loot_gate_general = box_blur(raw_color_match_general.astype(float), 17).squeeze() < 0.5
-    
-    convolved_match_general = box_blur(color_scores_general, 3).squeeze()
-    filtered_match_general = (convolved_match_general > 0.2) & brightness_filter # loot_gate_general
-    result_log(f'General loot detection: {np.any(filtered_match_general)}')
+    # generic loot
+    generic_loot_match = detect_generic_loot(frame1, frame2, color_diff, unsigned_color_diff, any_changes, color_score)['result']
+    result_log(f'General loot detection: {np.any(generic_loot_results)}')
 
     # corpse loot
-    color_match_corpse = match_color_grades_std(unsigned_color_diff, np.array([29, 30, 18]), min_pixel_value=15, tolerance=3)
-    # ignore top third of the room
-    color_match_corpse[:frame1.shape[0] // 3,:] = False
-    convolved_match_corpse = box_blur(color_match_corpse.astype(float), 5).squeeze()
-    filtered_match_corpse = convolved_match_corpse > 0.9
-    result_log(f'Corpse loot detection: {np.any(filtered_match_corpse)}')
+    corpse_loot_match = detect_corpse_loot(frame1, frame2, color_diff, unsigned_color_diff, any_changes, color_score)['result']
+    result_log(f'Corpse loot detection: {np.any(corpse_loot_match)}')
 
     # collection (?)
-    filtered_matches = filtered_match_general | filtered_match_corpse
+    filtered_matches = generic_loot_match | corpse_loot_match
 
     loot_coords = []
-    grid_size = 10 # let's say 1080p => 10x10 grid (~20k pixels per cell)
-    while scan_bounds.area / (grid_size * grid_size) < 20000: grid_size -= 1
+    v_gird_size = scan_bounds.height // 95
+    h_gird_size = scan_bounds.width // 110
     point_color = get_debug_color(randrange(10))
-    gwm = 2 if frame1.shape[1] / frame1.shape[0] > 1.6 else 1 # grid width multiplier for if room is too wide
     loot_proximity_threshold = 40 # how close two loot points can be 
-    for y in range(grid_size):
-        for x in range(gwm * grid_size):
-            start_pos = (int(x * scan_bounds.width / (gwm * grid_size)), int(y * scan_bounds.height / grid_size))
-            end_pos = (int((x + 1) * scan_bounds.width / (gwm * grid_size)), int((y + 1) * scan_bounds.height / grid_size))
+    for y in range(v_gird_size):
+        for x in range(h_gird_size):
+            start_pos = (int(x * scan_bounds.width / h_gird_size), int(y * scan_bounds.height / v_gird_size))
+            end_pos = (int((x + 1) * scan_bounds.width / h_gird_size), int((y + 1) * scan_bounds.height / v_gird_size))
             cell_bounds = Bounds(*start_pos, *end_pos)
             cell_patch = filtered_matches[cell_bounds.to_slice()]
             ys, xs = cell_patch.nonzero()

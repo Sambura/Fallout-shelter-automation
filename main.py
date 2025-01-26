@@ -100,15 +100,13 @@ def match_room_with_structural(structural_rooms, room_bounds):
 # TODO's list:
 # 
 # would be cool:
-#   - look into optimizing loot detecting in dialogues (look for loot while dialogue is on?)
-#   - change loot grid layout (base on vertical size instead?)
+#   - make camera pan adaptive (traveled distance vs expected, adjust velocity)
+#       + will have to account for panning blocking, room being partially on the screen, accidental target switch during panning, etc.
 #
 # bugs(?):
 #   - after dialogue / battle, look for `mission complete` pop up to avoid accidentally clicking on it (may be unnecessary if loot will not be searched in top half) 
 #        - fun fact, you can also know the mission is complete by looking at topright button - there will be an exclamation mark if mission is complete
 #   - note: `objective complete` popups are not clickable, no need to look for them i think
-#   - rewrite the thing that detects room click, we recently got `gave up on clicking` due to faulty click recognition
-#   - missed a crit because of inconsistent timings: `Crit diff info gathered: ['0.52', '0.63', '0.63'], avg: 0.59s, std: 0.0522`
 #   
 
 ###
@@ -117,16 +115,16 @@ def match_room_with_structural(structural_rooms, room_bounds):
 
 class FalloutShelterAutomationApp:
     # constants (?)
-    version = 'v0.4.3'
+    version = 'v0.5.0'
     app_update_interval_ms: int = 20
     "Controls how often does app make regular update iterations (e.g. updating displayed log, starting async tasks, etc.)"
-    chord_start_sequence: str = '<ctrl>+f'
+    chord_start_sequence: str = '<ctrl>+f' # enter this key combination to start a chord
 
     # mission script parameters (game related)
     camera_pan_deadzone_size: float = 0.05
     "Precision of camera panning - the center of the room should end up in a rectangle with dimensions camera_pan_deadzone_size * screen_shape"
-    camera_pan_initial_duration = 0.1 # TODO: remove?
-    camera_pan_base_velocity = 3200 # distance divided by this is approximate pan time  
+    camera_default_pan_distance = 500 # pan_camera will use this distance if no arguments are supplied
+    camera_pan_velocity = 3200 # distance divided by this is approximate pan time  
     crit_wait_count = 4 # how many crits to see for data collection before striking?
     dialogue_mode: str = 'manual' # random / manual
     "Controls which dialog handler is used when selecting dialog option"
@@ -197,14 +195,15 @@ class FalloutShelterAutomationApp:
         progress_log(f'Clicking button #{button_index + 1}...')
         self.mouse_click(*buttons[button_index].bounds.pos)
 
+    # when clicking on a room, click animation may be as short as 0.25s (visible in original room bounds)
+    # if you look outside of room bounds (~5-10% larger bounds), animation is visible for around 0.45-0.5s 
     def navigate_to_room(self, room_bounds: Bounds, click=True, zoom_in=True):
-        progress_log(f'Navigating to the room... : {room_bounds}')
+        progress_log(f'Navigating to the room: {room_bounds}')
 
-        pan_duration = self.camera_pan_initial_duration
         last_direction = None
-        last_bounds = Bounds(*(np.ones(4)*(-10000000000))) # idk lol
         blocked_direction = None
 
+        ### Zoom in the camera on the room
         if zoom_in:
             room_anchors = room_bounds.get_corners(get_8=True)
             furthest_anchor_i = np.argmax([np.linalg.norm(x) for x in np.array(room_anchors) - self.screen_center_xy])
@@ -220,135 +219,127 @@ class FalloutShelterAutomationApp:
             vectors_norms = [[np.linalg.norm(np.array(corner) - zoom_point) for corner in z.get_corners()] for x, y, z in rooms]
             room_bounds = rooms[np.argmin([np.min(norms) for norms in vectors_norms])][2]
 
-        direction, distance = self.direction_to_screen_center(room_bounds, blocked_direction)
+        ### Camera panning to center the room on the screen
         distance_multiplier = 1 # needed to avoid infinite panning loops
-        while direction is not None:
+        while distance_multiplier > 0.05: # loop should end due to break, loop condition is a backup solution
+            direction, distance = self.direction_to_screen_center(room_bounds, blocked_direction)
+            if direction is None: break
             if are_opposite_directions(last_direction, direction): 
                 distance_multiplier *= 0.98
-                if distance_multiplier < 0.05: break # really shouldn't happen but hey
 
-            progress_log(f'Panning now: {direction} for {distance}px ({int(100 * distance_multiplier)}%)')    
+            progress_log(f'Panning: {direction} for {distance}px ({int(100 * distance_multiplier)}%)')    
             self.pan_camera(direction, distance=distance * distance_multiplier)
 
-            last_bounds = room_bounds
-
             pan_bounds = self.get_panning_bounds(room_bounds, direction)
-            start_time = perf_counter()
+            rescan_start_time = perf_counter()
             progress_log(f'Finding room again...')
             sleep(0.1) # post-pan delay
-            while True: # put iteration limit?
-                screen_crop = self.latest_frame[pan_bounds.to_slice()] # how can this be not assigned + the outer loop is terminated??
+            while True:
+                screen_crop = self.latest_frame[pan_bounds.to_slice()]
                 debug_log_image(screen_crop, 'navigation-rescan')
                 rooms = detect_rooms(screen_crop)
-                if perf_counter() - start_time > 2:
-                    progress_log('Panning failed: timeout')
-                    return False, None, None # timeout
                 if len(rooms) > 0: break
+                if perf_counter() - rescan_start_time > 2:
+                    progress_log('Panning failed: timeout')
+                    return False, None, None
 
-            room_bounds = rooms[0][2].offset(pan_bounds.low_pos)
-
-            # progress_log(f'New bounds: {room_bounds}')
+            last_bounds, room_bounds = room_bounds, rooms[0][2].offset(pan_bounds.low_pos)
             if last_bounds.x == room_bounds.x and last_bounds.y == room_bounds.y:
-                progress_log(f'Panning blocked... `{direction}`')
+                progress_log(f'Panning blocked: `{direction}`')
                 if blocked_direction is not None and blocked_direction != direction: break
                 blocked_direction = direction
 
             last_direction = direction
-            direction, distance = self.direction_to_screen_center(room_bounds, blocked_direction)
 
         progress_log('Panning complete')
-        if click:
-            sleep(0.1) # post panning delay (camera seems to be panning a bit after a key is released)
-            debug_log_image(self.freeze_frame(), 'navigation-end-grab')
-            rooms = detect_rooms(self.fixed_frame)
-            filtered_rooms = [x for _, _, x in rooms if x.shape == room_bounds.shape]
-            if len(filtered_rooms) == 0:
-                progress_log('Navigation: target lost')
-                return False, None, None
+        if not click:
+            return True, room_bounds, None
 
-            room_bounds = min(filtered_rooms, key=lambda x: np.linalg.norm(x.pos - room_bounds.pos))
-
-            for _ in range(5):
-                pre_click_room = self.latest_frame[room_bounds.to_slice()]
-
-                progress_log(f'Clicking: {room_bounds.x, room_bounds.y}')
-                self.mouse_click(room_bounds.x, room_bounds.y)
-
-                # TODO: wait for like 1s and then analyze all frames from buffer instead of relying on hardcoded delay?
-                sleep(0.5) # click diff wait
-                post_click_room = self.latest_frame[room_bounds.to_slice()]
-
-                click_diff = compute_img_diff_ratio(post_click_room, pre_click_room)
-
-                progress_log(f'Post-click pixel diff: {click_diff*100:0.2f}%')
-
-                diff_mask = np.any(post_click_room != pre_click_room, axis=2)
-                log_image(pre_click_room, 'preclick', increment_counter=False)
-                log_image(post_click_room, 'postclick', increment_counter=False)
-                log_image(diff_mask, 'clickdiff')
-
-                ## !!!!
-                ## TODO: not enough validation for click diff detection: add checking of diff colors
-                ## !!!!
-
-                if True:
-                    temp_test_rooms = detect_rooms(pre_click_room, return_fragments=True)
-                    if len(temp_test_rooms) != 1 or not is_fragment_rectangular(temp_test_rooms[0]):
-                        # TODO: this assertion is not entirely valid (don't remember why, but figure it out later and maybe remove this)
-                        progress_log('ALERT: room_focus assertion failed')
-                        log_image(pre_click_room, 'assertion-failed', increment_counter=False)
-
-                # room click diff threshold
-                if click_diff >= 0.01: 
-                    if is_room_click_diff(diff_mask):
-                        return True, room_bounds, pre_click_room
-                    progress_log(':: Click diff detected, flagged as false positive')
-                progress_log(f'Click failed, repeat:')
-
-            progress_log('Gave up on clicking...')
+        ### Click on room and verify the click was registered
+        sleep(0.1) # wait to make sure camera is still (idk if needed)
+        debug_log_image(self.freeze_frame(), 'navigation-end-grab')
+        rooms = detect_rooms(self.fixed_frame)
+        filtered_rooms = [x for _, _, x in rooms if x.shape == room_bounds.shape]
+        if len(filtered_rooms) == 0:
+            progress_log('Navigation: target lost')
             return False, None, None
 
-        return True, room_bounds, pre_click_room
+        room_bounds = min(filtered_rooms, key=lambda x: np.linalg.norm(x.pos - room_bounds.pos))
+
+        max_click_attempts = 3
+        for _ in range(max_click_attempts):
+            pre_click_room = self.latest_frame[room_bounds.to_slice()]
+
+            progress_log(f'Clicking: {room_bounds.x, room_bounds.y}')
+            self.mouse_click(room_bounds.x, room_bounds.y)
+            click_time = perf_counter()
+
+            # detect click animation, 1 second timeout
+            for frame in self.iterate_latest_frames(min_frame_delta=0.04, max_duration=1):
+                next_room_frame = frame[room_bounds.to_slice()]
+                click_diff, diff_mask = compute_img_diff_ratio(next_room_frame, pre_click_room, get_mask=True)
+                if click_diff < 0.01: continue
+
+                if is_room_click_diff(diff_mask):
+                    debug_log_image(pre_click_room, 'preclick', increment_counter=False)
+                    debug_log_image(next_room_frame, 'postclick', increment_counter=False)
+                    debug_log_image(diff_mask, 'clickdiff')
+                    return True, room_bounds, pre_click_room
+
+            progress_log(f'Click failed, repeat:')
+
+        progress_log('Gave up on clicking...')
+        return False, None, None
 
     def make_critical_strike(self, crit_bounds):
         grab_size = min(crit_bounds.width, crit_bounds.height) // 3
         grab_bounds = Bounds.from_center(crit_bounds.x, crit_bounds.y, grab_size, grab_size)
         grab_bbox = grab_bounds.get_bbox()
 
-        progress_log(f'Waiting for data...')
-        sleep(1.5)
-        had_overlay = self.overlay_on
-        self.hide_overlay()
-        sleep(0.5)
-        captured_frames = self.copy_frames_buffer()
-        hit_timings = []
-
+        progress_log(f'Collecting timings...')
+        
+        crit_frames_debug = []
+        hit_timings = [] # [(crit_start, crit_end), ...]
         last_i = -2 # does not have to be -2, any negative (except -1) will do the same
-        for i, (frame, abs_time, delta) in enumerate(captured_frames):
+        had_overlay = self.overlay_on
+        capture_start = perf_counter()
+        for i, (frame, timestamp) in enumerate(self.iterate_latest_frames(max_duration=2, yield_timestamp=True)):
             crop = crop_image(frame, grab_bbox)
             crit_pixels = np.sum(match_color_exact(crop, critical_hit_color))
             if crit_pixels >= min_critical_pixels:
-                if last_i + 1 == i: # if several in a row: take average (yes its not ideal for more than 2 frames)
-                    hit_timings[-1] = (hit_timings[-1] + abs_time) / 2
+                if last_i + 1 == i: # this frame is continuation of the previous hit, update end timestamp
+                    hit_timings[-1][1] = timestamp
                 else:
-                    hit_timings.append(abs_time)
+                    hit_timings.append((timestamp, timestamp))
                 last_i = i
+                crit_frames_debug.append((frame, timestamp))
 
-        if len(hit_timings) < 2:
-            progress_log('Crit failed...')
+                if len(hit_timings) >= self.crit_wait_count:
+                    break
+
+            if perf_counter() - capture_start >= 1.5 or len(hit_timings) + 1 == self.crit_wait_count:
+                self.hide_overlay()
+            
+        if len(hit_timings) < 2: # because need at least 2 timings to get time delta
+            progress_log('Crit failed: not enough data')
             if had_overlay: self.show_overlay()
             return
 
+        hit_timings = np.mean(hit_timings, axis=1)
         diffs = np.diff(hit_timings)
-        avg_diff = np.mean(diffs) # interval between crits
+        avg_diff = np.median(diffs) # median should "filter out" outliers, unlike mean
         std_diff = np.std(diffs)
+        if std_diff > 0.02:
+            result_log(f'Warning: high timing deviation ({1000 * std_diff:0.2f} ms)')
+
+        # calculate next crit time
         next_crit = hit_timings[-1]
         for _ in range(10): # limit the iteration number
             if next_crit < perf_counter(): 
                 next_crit += avg_diff
 
         next_crit -= 0.03 # bias
-        while perf_counter() - 3 * std_diff < next_crit: sleep(0.0001)
+        while perf_counter() - std_diff < next_crit: sleep(0.0001)
     
         self.mouse_input.press(mouse.Button.left)
         sleep(0.08)
@@ -357,7 +348,11 @@ class FalloutShelterAutomationApp:
         progress_log(f'Crit diff info gathered: {[f"{x:0.2f}" for x in diffs]}, avg: {avg_diff:0.2f}s, std: {std_diff:0.4f}')
 
         if had_overlay: self.show_overlay()
-        sleep(2) # wait for crit message to disappear
+        finish_time = perf_counter()
+        for frame, timestamp in crit_frames_debug:
+            debug_log_image(frame, f'crit-frame-{timestamp-crit_frames_debug[0][1]:0.2f}')
+
+        sleep(max(0, 2 - perf_counter() + finish_time)) # wait for crit message to disappear
 
     def battle_iteration(self):
         "Freeze frame before calling"
@@ -407,7 +402,7 @@ class FalloutShelterAutomationApp:
         def scan_primary(directions):
             nonlocal reached_left, reached_right
             if direction in directions: 
-                self.pan_camera(direction, self.camera_pan_initial_duration)
+                self.pan_camera(direction)
                 reached_left = False
                 reached_right = False
                 return True
@@ -416,10 +411,10 @@ class FalloutShelterAutomationApp:
     
         def scan_secondary():
             if not reached_left:
-                self.pan_camera('left', self.camera_pan_initial_duration)
+                self.pan_camera('left')
                 return True
             if not reached_right:
-                self.pan_camera('right', self.camera_pan_initial_duration)
+                self.pan_camera('right')
                 return True
             
             return False
@@ -531,10 +526,11 @@ class FalloutShelterAutomationApp:
             start_time = perf_counter()
             current_room = self.latest_frame[self.current_room_bounds.to_slice()]
             diff = compute_img_diff_ratio(pre_click_img, current_room)
-            debug_log_image(current_room, f'walk-wait-{diff*100:0.2f}-diff')
             progress_log(f'Waiting for walk completion: current diff {100*diff:0.2f}%')
 
-            if diff >= room_reached_min_diff: break # room reached!
+            if diff >= room_reached_min_diff: 
+                debug_log_image(current_room, f'room-reached-{diff*100:0.2f}-diff')
+                break # room reached!
 
         progress_log(f'Walk complete! Analyzing situation...') # room reached, wrap up and switch state
         self.post_walk_screen_img = self.latest_frame
@@ -801,7 +797,6 @@ class FalloutShelterAutomationApp:
         progress_log('>>> Starting capture thread')
         self.start_capture_thread()
 
-        self.dialogue_detected = True # don't question it
         # ensure the first iteration performs zoom out
         self.zoomed_out = False
         self.need_zoom_out = True
@@ -821,6 +816,10 @@ class FalloutShelterAutomationApp:
 
     def toggle_mission_pause(self):
         self.mission_paused = not self.mission_paused
+
+    ###
+    ### Capture worker and frame utils
+    ###
 
     def start_capture_thread(self):
         if self.capture_thread is not None: return
@@ -878,6 +877,43 @@ class FalloutShelterAutomationApp:
         
         raise Exception('I think this should not be reached? idk')
 
+    def iterate_latest_frames(self, min_frame_delta=1e-6, max_frames_count=None, max_duration=None, wait_for_next=False, yield_timestamp=False):
+        "Generator for frames: returns every captured frame starting from now with specified frame delta, allowing for long processing for each frame (limited by buffer duration)"
+        # this is to avoid yielding the same frame multiple times
+        if min_frame_delta <= 0: raise Exception('min_frame_delta should be positive')
+        if max_frames_count is None: max_frames_count = float('inf')
+        if max_duration is None: max_duration = float('inf')
+        if max_frames_count < 1 or max_duration <= 0: return
+        if wait_for_next: self.next_frame()
+
+        # get latest frame data
+        start_frame, start_frame_time, _ = self.copy_frames_buffer()[-1]
+        yield (start_frame, start_frame_time) if yield_timestamp else start_frame
+
+        last_frame_time = start_frame_time
+        frames_yielded = 1
+        frames_buffer = []
+        while frames_yielded < max_frames_count:
+            # buffer all available frames
+            current_frames = self.copy_frames_buffer()
+            for frame, time, _ in current_frames:
+                if time < last_frame_time + min_frame_delta: continue
+                frames_buffer.append((frame, time))
+                last_frame_time = time
+            
+            del current_frames
+            if len(frames_buffer) == 0:
+                sleep(max(0, min_frame_delta - perf_counter() + last_frame_time))
+                continue
+            
+            # yield next frame from buffer
+            next_frame, next_time = frames_buffer[0]
+            if next_time - start_frame_time > max_duration: return
+            yield (next_frame, next_time) if yield_timestamp else next_frame
+            if next_time - start_frame_time + min_frame_delta > max_duration: return
+            del frames_buffer[0]
+            frames_yielded += 1
+
     ### 
     ### App initialization
     ###
@@ -889,9 +925,9 @@ class FalloutShelterAutomationApp:
         }
         
         # Entries format:  <character>: (function, name/title, repeat_execution, [no_new_thread])
-        self.execution_target_map = {
+        self.execution_target_chord_map = {
              # replace with whatever you need at the time
-            '`': (lambda x: new_detect_loot_corpse_debug(x.screen_bounds, x.no_overlay_grab_screen), 'temp debug function', False),
+            '`': (lambda x: detect_loot_corpse_debug(grab_screen_func=x.no_overlay_grab_screen, mock_mode=self.mock_mode), 'temp debug function', False),
             'm': (lambda x: detect_med_buttons(x.no_overlay_grab_screen()), 'meds detection', True),
             'c': (lambda x: detect_critical_button(x.no_overlay_grab_screen()), 'critical cue detection', True),
             'r': (lambda x: detect_rooms(x.no_overlay_grab_screen()), 'rooms detection', True),
@@ -907,11 +943,13 @@ class FalloutShelterAutomationApp:
             '+': (FalloutShelterAutomationApp.debug_dump_motion_diff_data, 'motion data dump', False),
             '-': (FalloutShelterAutomationApp.debug_test_iou, 'iou test', True),
             '=': (FalloutShelterAutomationApp.toggle_mission_pause, 'Pause/resume mission script', False, True),
+        }
+        "Maps characters on keyboard to functions to start upon chord completion"
+        self.execution_target_map = { # '<char>': (function, message, needs_debug_frame?)
             ']': (FalloutShelterAutomationApp.next_mock_frame_directory, 'Next mock frame directory', False),
             '[': (FalloutShelterAutomationApp.prev_mock_frame_directory, 'Previous mock frame directory', False),
             '0': (FalloutShelterAutomationApp.debug_reset_mock_frames, 'Reset mock frame index', False)
         }
-        "Maps characters on keyboard to functions to start upon chord completion"
 
         self.keyboard_input = keyboard.Controller()
         self.mouse_input = mouse.Controller()
@@ -926,7 +964,7 @@ class FalloutShelterAutomationApp:
         print('Welcome to FSA! Initializing...')
         
         native_capture = not self.force_pil_capture
-        if self.mock_frames_path is not None: # set to true to enable mock screen capture
+        if self.mock_frames_path is not None:
             self.grab_screen, self.native_grab_screen = init_screen_capture(mode='mock', mock_directory=self.mock_frames_path)
             set_max_debug_frames(10)
             self.mock_mode = True
@@ -984,6 +1022,7 @@ class FalloutShelterAutomationApp:
         self.state_overlay_error[2:-2,2:-2] = 0
         self.state_overlay_mission_complete = np.ones((*self.screen_shape, 4), dtype=np.uint8) * np.array([60, 210, 10, 255])
         self.state_overlay_mission_complete[3:-3,3:-3] = 0
+        draw_circle(self.state_overlay_mission_complete, self.screen_center_xy, self.screen_shape_xy[1] // 8, np.array([60, 210, 10, 255]), 15)
         self.state_overlay = self.state_overlay_ok
 
         sx, sy = self.screen_center_xy
@@ -1068,11 +1107,13 @@ class FalloutShelterAutomationApp:
         if restore_overlay: self.show_overlay()
 
     def pan_camera(self, direction, duration=None, distance=None):
+        if duration is None and distance is None:
+            distance = self.camera_default_pan_distance
+        
         if distance is not None:
             if duration is not None: raise Exception('duration and distance cannot both be set')
-            duration = distance / self.camera_pan_base_velocity
-        elif duration is None:
-            duration = 0.05
+            duration = distance / self.camera_pan_velocity
+
         self.keyboard_input.press(CAMERA_PAN_KEYS[direction])
         sleep(duration)
         self.keyboard_input.release(CAMERA_PAN_KEYS[direction])
@@ -1123,16 +1164,16 @@ class FalloutShelterAutomationApp:
             self.keyboard_chord_pending = True
             return
 
-        if key.char in self.execution_target_map:
-            if len(self.execution_target_map[key.char]) == 4 and self.execution_target_map[key.char][3]:
-                func, message, repeat, _ = self.execution_target_map[key.char]
+        if key.char in self.execution_target_chord_map:
+            if len(self.execution_target_chord_map[key.char]) == 4 and self.execution_target_chord_map[key.char][3]:
+                func, message, repeat, _ = self.execution_target_chord_map[key.char]
                 if message is not None: result_log(f'Executing {message}...')
                 create_debug_frame()
                 func(self)
                 self.display_debug()
                 return
 
-            func, message, repeat = self.execution_target_map[key.char]
+            func, message, repeat = self.execution_target_chord_map[key.char]
             if message is not None: result_log(f'Starting {message}...')
             def _exec_target(self):
                 create_debug_frame()
@@ -1171,6 +1212,18 @@ class FalloutShelterAutomationApp:
 
         return _func
 
+    def handle_keyboard_press(self, key):
+        if self.script_running and key == keyboard.Key.esc and not self.mask_escape_key: 
+            self.terminate() # esc during mission script should abort execution (kill-switch)
+
+        if not hasattr(key, 'char'): return
+        if key.char in self.execution_target_map:
+            func, message, visual_debug = self.execution_target_map[key.char]
+            if message is not None: result_log(f'Executing {message}...')
+            if visual_debug: create_debug_frame()
+            func(self)
+            if visual_debug: self.display_debug()
+
     def keyboard_listener(self):
         "Continuously listen to keyboard and call chord handler when appropriate. Ideally should not be modified"
         def begin_chord():
@@ -1186,17 +1239,17 @@ class FalloutShelterAutomationApp:
             return _func
         
         def keyboard_on_press(key):
-            if self.script_running and key == keyboard.Key.esc and not self.mask_escape_key: 
-                self.terminate() # esc during mission script should abort execution (kill-switch)
-    
             self.last_key_pressed = key
 
-            if self.keyboard_chord_pending:
-                try:
+            # exception == keyboard listener dies, so have to catch that 
+            try:
+                if self.keyboard_chord_pending:
                     self.handle_keyboard_chord(key) 
-                except:
-                    progress_log('Keyboard listener thread encountered exception:')
-                    traceback.print_exc()
+                else:
+                    self.handle_keyboard_press(key)
+            except:
+                progress_log('Keyboard listener thread encountered exception:')
+                traceback.print_exc()
             
             if self.terminate_pending: return False # should be AFTER chord handler
             for_canonical(chord_start_hotkey.press)(key)

@@ -37,7 +37,6 @@ def log_image(img, postfix, increment_counter=True):
     save_thread = threading.Thread(target=lambda: Image.fromarray(img_copy).save(filename))
     save_thread.start()
 
-# maybe add some option to disable debug logs specifically
 def debug_log_image(img, postfix, increment_counter=True):
     if not debug_log_images: return
     log_image(img, postfix, increment_counter)

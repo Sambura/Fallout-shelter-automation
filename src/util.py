@@ -14,8 +14,9 @@ def is_horizontal(direction: str) -> bool: return direction in H_DIRECTIONS
 
 def slow_loop(interval, max_iter_count=None, max_duration=None):
     "for x in slow_loop(...); interval in seconds. Infinite iterations by default"
-    if max_iter_count is not None and max_iter_count < 1: return
-    if max_duration is not None and max_duration <= 0: return
+    if max_iter_count is None: max_iter_count = float('inf')
+    if max_duration is None: max_duration = float('inf')
+    if max_iter_count < 1 or max_duration <= 0: return
     start_time = last_yield_time = perf_counter()
     i = 0
     while True:
@@ -24,8 +25,8 @@ def slow_loop(interval, max_iter_count=None, max_duration=None):
         last_yield_time = perf_counter()
         sleep(max(0, interval - (current_time - last_yield_time)))
         i += 1
-        if max_iter_count is not None and i >= max_iter_count: return
-        if max_duration is not None and perf_counter() - start_time >= max_duration: return
+        if i >= max_iter_count: return
+        if perf_counter() - start_time >= max_duration: return
 
 def rotate_vector_2d(vector, angle_deg):
     angle = np.radians(angle_deg)

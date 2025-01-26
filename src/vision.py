@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import cv2
 import os
+import re
 import platform
 
 # local terms:
@@ -47,7 +48,8 @@ def load_mock_frames(path, mode='frames'):
 
     # filenames should have format (\d+)-.*?\.(png|jpg)
     # example: 102-mock-frame.png
-    for filename in sorted(os.listdir(path), key=lambda x: int(x.split('-')[0])):
+    frame_names = [x for x in os.listdir(path) if '-' in x and re.match(r'\d+', x.split('-')[0])]
+    for filename in sorted(frame_names, key=lambda x: int(x.split('-')[0])):
         if filename.endswith(('.jpg', '.png')):
             img_path = os.path.join(path, filename)
             img = Image.open(img_path)
@@ -93,6 +95,9 @@ def crop_image(image, bbox):
 
 def grab_mock_screen(bbox=None):
     global _mock_index
+    if _mock_index >= len(_mock_frames):
+        result_log('Error: out of mock frames, resetting')
+        reset_mock_frame_index()
     index = _mock_index
     if _mock_mode != 'fixed': _mock_index += 1
     return crop_image(_mock_frames[index].copy(), bbox)
@@ -176,6 +181,7 @@ class Bounds:
         return corners
 
     def to_rect(self):
+        "Returns this list: [corner_x, corner_y, width, height] (the corner is the top-left, i.e. the smallest x,y coordinates)"
         return [self.x_min, self.y_min, self.width, self.height]
 
     def from_center(x, y, width, height):
@@ -189,18 +195,24 @@ class Bounds:
         return self.width < width or self.height < height
 
     def from_points(*points):
+        "Creates bounds that contain all the specified points (each argument is a tuple of x, y coords)"
         np_points = np.array(points)
         xs, ys = np_points[:,0], np_points[:,1]
         return Bounds(np.min(xs), np.min(ys), np.max(xs), np.max(ys))
 
     def get_scaled_from_center(self, scale):
+        "Returns bounds with the same center as original, but scaled with respect to center point"
         half_width = int(scale * self.width / 2)
         half_height = int(scale * self.height / 2)
         return Bounds(self.x - half_width, self.y - half_height, self.x + half_width, self.y + half_height)
     
-    def contains_bounds(self, bounds):
+    def contains_bounds(self, bounds, strict=False):
+        "Returns true if `bounds` are located entirely inside these Bounds. Use strict to ensure the two bounds' borders do not touch"
         if self.x_max < bounds.x_max or bounds.x_min < self.x_min: return False
         if self.y_max < bounds.y_max or bounds.y_min < self.y_min: return False
+        if strict:
+            if self.x_max == bounds.x_max or self.x_min == bounds.x_min: return False
+            if self.y_max == bounds.y_max or self.y_min == bounds.y_min: return False
         return True
 
     def contains_point(self, x, y):
@@ -211,14 +223,17 @@ class Bounds:
         ox, oy = offset
         return (slice(self.y_min + oy, self.y_max + 1 + oy), slice(self.x_min + ox, self.x_max + 1 + ox))
 
-    def get_bbox(self): return [self.x_min, self.y_min, self.x_max, self.y_max]
+    def get_bbox(self): 
+        "Returns [x_min, y_min, x_max, y_max]"
+        return [self.x_min, self.y_min, self.x_max, self.y_max]
 
     def offset(self, offset):
+        "Offset bounds position"
         x, y = offset
         return Bounds(self.x_min + x, self.y_min + y, self.x_max + x, self.y_max + y)
 
     def offset_bounds(self, *offsets):
-        "This is more of shrink / expand function then offset"
+        "Expand/contract bounds by the specified offsets with respect to center"
         if len(offsets) == 1:
             v = offsets[0]
             return Bounds(self.x_min - v, self.y_min - v, self.x_max + v, self.y_max + v)
@@ -265,7 +280,17 @@ class Fragment:
             self.patch_mask[self.points[:,0] - self.bounds.y_min, self.points[:,1] - self.bounds.x_min] = True
 
         if masked_patch:
-            self.masked_patch = self.source_patch * self.patch_mask[:,:,np.newaxis]
+            if len(self.source_patch.shape) == 2:
+                self.masked_patch = self.source_patch * self.patch_mask
+            else:
+                self.masked_patch = self.source_patch * self.patch_mask[:,:,np.newaxis]
+
+    def unite_with(self, fragment):
+        "Updates masked points and bounds. May break things since source_pixels may be too small after union"
+        self.points = np.unique(np.concatenate((self.points, fragment.points)), axis=0)
+        self.point_count = len(self.points)
+        self.bounds = Bounds.from_points(*self.points[:, ::-1])
+        self.masked_patch = self.source_patch = self.patch_mask = None
 
 def detect_fragment(pixels, x, y, mask, value, matching_mask):
     _, _, _, rect = cv2.floodFill(mask, matching_mask, (x, y), value, 255, 255, cv2.FLOODFILL_FIXED_RANGE)
@@ -275,7 +300,7 @@ def fragment_mask_prepare(mask):
     """Inverts the given array and pads with 1 pixel from each side. Resulting array is of type uint8"""
     return np.pad(np.logical_not(mask), 1, 'constant', constant_values=True).astype(np.uint8)
 
-def detect_fragments(pixels, fragments_mask, **compute_kwargs):
+def detect_fragments(pixels, fragments_mask, **compute_kwargs) -> tuple[list[Fragment], np.ndarray, np.ndarray, np.ndarray]:
     "returns list of found fragments, list of x and list of y coordinates derived from fragment_mask, and the numeric mask (fragments, xs, ys, mask)"
     mask = np.zeros(pixels.shape[:2], dtype=int)
     ys, xs = np.where(fragments_mask)
@@ -332,7 +357,7 @@ def match_color_grades(pixels, color, min_pixel_value=0, tolerance=0):
     """
     Allows to match any pixels that have the same tone as `color` (e.g. `color` or darker)
     NOTE: this function is primarily suited to match RGB multiples of the specified color, rather than the actual color tone.
-    consider using `match_color_hue` if you need a more general mather
+    consider using `match_color_hue` if you need a more general matcher
     Use `min_pixel_value` to mask all pixels that are too dark. This is the min value of r+g+b of pixel
     Tolerance controls how close the color tone should be to the `color` to match
     """
@@ -438,9 +463,11 @@ def strip_rectangular_fragment(fragment: Fragment, min_side_fill_fraction):
     do not expect this to work for your usecase"""
     raise Exception('I changed my mind, not gonna implement this')
 
-def compute_img_diff_ratio(img1, img2):
+def compute_img_diff_ratio(img1, img2, get_mask=False):
     "computes fraction of differing pixels between two images"
-    return np.sum(np.any(img1 != img2, axis=2)) / np.prod(img1.shape[:2])
+    diff_mask = np.any(img1 != img2, axis=2)
+    ratio = np.sum(diff_mask) / np.prod(img1.shape[:2])
+    return (ratio, diff_mask) if get_mask else ratio
 
 def compute_motion_diff(old_frame, current_frame, future_frame, diff_threshold=None):
     "Specify integer threshold to ignore too small changes"
