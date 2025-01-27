@@ -927,7 +927,7 @@ class FalloutShelterAutomationApp:
         # Entries format:  <character>: (function, name/title, repeat_execution, [no_new_thread])
         self.execution_target_chord_map = {
              # replace with whatever you need at the time
-            '`': (lambda x: detect_loot_corpse_debug(grab_screen_func=x.no_overlay_grab_screen, mock_mode=self.mock_mode), 'temp debug function', False),
+            '`': (lambda x: debug_detect_corpse_loot(grab_screen_func=x.no_overlay_grab_screen, mock_mode=self.mock_mode), 'temp debug function', False),
             'm': (lambda x: detect_med_buttons(x.no_overlay_grab_screen()), 'meds detection', True),
             'c': (lambda x: detect_critical_button(x.no_overlay_grab_screen()), 'critical cue detection', True),
             'r': (lambda x: detect_rooms(x.no_overlay_grab_screen()), 'rooms detection', True),

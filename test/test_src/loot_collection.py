@@ -50,9 +50,12 @@ class LootTestCase(TestCase):
             self.valid = False
             return
         
-        self.valid = self.init_test()
+        self.valid = True
+        self.initialized = False
     
     def init_test(self):
+        if self.initialized: return self.valid
+        self.initialized = True
         self.generic_loot_fragments = []
         self.corpse_loot_fragments = []
 
@@ -114,6 +117,9 @@ class LootTestCase(TestCase):
         return True
 
     def run_test(self):
+        self.valid = self.init_test()
+        if not self.valid: return False
+        
         self.test_executed = True
         def match_results(target_fragments, results, label):
             mask = np.zeros_like(results)

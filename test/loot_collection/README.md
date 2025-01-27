@@ -1,6 +1,6 @@
 # Few words about loot collection autotests
 
- * Each test is in a directory named `XXX-[G][C][N]`, where XXX - ordinal test number, G - if contains generic loot, C - corpse loot, N - neither
+ * Each test is in a directory named `XXX-[G][C][N][O]`, where XXX - ordinal test number, G - if contains generic loot, C - corpse loot, N - neither, O - optional
  * Each directory contains 3 .png files: 01-frame.png, 02-frame.png as source frames, and autotest-frame.png containing correct loot locations
 
 ## Autotest frame

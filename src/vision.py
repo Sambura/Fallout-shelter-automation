@@ -401,7 +401,7 @@ def match_cont_color(pixels, color, tolerance):
     """
     return match_cont_color_values(pixels, color) <= tolerance
 
-def detect_blending_pixels(pixels, primary_color, secondary_color, max_blending=1, max_deviation=0):
+def match_blending_pixels(pixels, primary_color, secondary_color, max_blending=1, max_deviation=0):
     """
     Returns mask that matches all the pixels that match any color from primary to secondary (RGB blending)
     max_blending controls actual value of secondary_color: = primary_color * (1 - max_blending) + secondary_color * max_blending
@@ -426,6 +426,13 @@ def detect_blending_pixels(pixels, primary_color, secondary_color, max_blending=
     close_pixels = np.logical_or(close_pixels_1, close_pixels_2)
 
     return np.logical_or(masked_results, close_pixels) # restore cut off pixels close to endpoints 
+
+def match_by_rgb_ltr_ratio(pixels, g2r, b2g):
+    "go on guess wth does this name mean"
+    g2r_ratios = pixels[:,:,1] / (pixels[:,:,0].astype(float) + 1) # +1 to avoid division by zero
+    b2g_ratios = pixels[:,:,2] / (pixels[:,:,1].astype(float) + 1)
+
+    return (g2r_ratios >= g2r) & (b2g_ratios >= b2g)
 
 def get_vertical_scanline_fraction(patch_mask, scanline):
     return np.mean(patch_mask[:, scanline])
