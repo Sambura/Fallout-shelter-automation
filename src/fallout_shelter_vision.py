@@ -60,7 +60,7 @@ def detect_rooms(pixels, return_fragments=False):
         if fragment.bounds.are_smaller_than(*min_room_size): continue
         
         # progress_log(f'New room fragment: {fragment.bounds}')
-        if debug_show_progress_visuals and np.all(pixels.shape[:2] == screen_shape):
+        if visual_debug_level >= VISUAL_DEBUG_PROGRESS and np.all(pixels.shape[:2] == screen_shape):
             draw_border(get_do(), fragment.bounds, np.array([255, 0, 0, 255]), thickness=1)
 
         valid_room, location = analyze_room(fragment)
@@ -71,7 +71,7 @@ def detect_rooms(pixels, return_fragments=False):
         detected_fragments.append(fragment)
 
         result_log(f'Room detected! {fragment.bounds} : {room_type}, location: {location}')
-        if debug_show_result_visuals and np.all(pixels.shape[:2] == screen_shape):
+        if visual_debug_level >= VISUAL_DEBUG_RESULT and np.all(pixels.shape[:2] == screen_shape):
             draw_border(get_do(), fragment.bounds, np.array([0, 0, 180, 255]), thickness=3)
 
     if return_fragments: return detected_fragments
@@ -109,7 +109,7 @@ def detect_med_buttons(pixels):
             continue
         color_ratio = low_color_count / high_color_count
 
-        # if debug_show_progress_visuals:
+        # if visual_debug_level >= VISUAL_DEBUG_PROGRESS:
         #     get_do()[mask == fragment.fragment_value] = get_debug_color(fragment.fragment_value)
         # progress_log(f'New fragment: ratio: {color_ratio * 100:0.2f}%; {clean_color_fraction * 100:0.2f}% clean colors')
 
@@ -123,7 +123,7 @@ def detect_med_buttons(pixels):
             if checker(fragment, color_ratio, clean_color_fraction): break
         else: continue
 
-        if debug_show_result_visuals:
+        if visual_debug_level >= VISUAL_DEBUG_RESULT:
             get_do()[mask == fragment.fragment_value] += get_debug_color(fragment.fragment_value)
     
     return detected
@@ -142,7 +142,7 @@ def detect_critical_button(pixels):
             fragments.remove(fragment); continue
         
         # progress_log(f'Detected critical cue fragment: {fragment.point_count} pixel count')
-        if debug_show_progress_visuals:
+        if visual_debug_level >= VISUAL_DEBUG_PROGRESS:
             get_do()[mask == fragment.fragment_value] += get_debug_color(fragment.fragment_value)
 
     detected = []
@@ -168,7 +168,7 @@ def detect_critical_button(pixels):
         for i in fragments_contained: assigned_fragments[i] = True
         detected.append(button_bounds)
         
-        if debug_show_result_visuals:
+        if visual_debug_level >= VISUAL_DEBUG_RESULT:
             draw_border(get_do(), button_bounds, np.array([255, 255, 255, 80]), 6)
 
     return detected
@@ -191,7 +191,7 @@ def detect_structural(pixels):
             fragments.remove(fragment); continue
         
         # progress_log(f'Detected structural fragment: {fragment.point_count} pixel count')
-        if debug_show_progress_visuals:
+        if visual_debug_level >= VISUAL_DEBUG_PROGRESS:
             get_do()[mask == fragment.fragment_value] = get_debug_color(fragment.fragment_value)
 
     if len(fragments) == 0: return None, None
@@ -217,14 +217,14 @@ def detect_enemies(pixels):
     detected = []
 
     for fragment in fragments:
-        if debug_show_progress_visuals:
+        if visual_debug_level >= VISUAL_DEBUG_PROGRESS:
             get_do()[mask == fragment.fragment_value] += get_debug_color(fragment.fragment_value)
 
         if fragment.point_count < enemy_healthbar_min_border_pixel_count: continue
 
         if is_fragment_rectangular(fragment):
             detected.append(fragment)
-            if debug_show_progress_visuals:
+            if visual_debug_level >= VISUAL_DEBUG_RESULT:
                 get_do()[mask == fragment.fragment_value] += np.array([50, 255, 20, 255])
 
     return len(detected) > 0, detected
@@ -273,7 +273,7 @@ def detect_structural_rooms(structural: Fragment):
         rooms.append(fragment.bounds.offset(structural.bounds.low_pos))
         
         # progress_log(f'Detected structural room ({fragment.bounds}) : border fraction {rect_fraction*100:0.2f}%, clearance: {clearance_fraction*100:0.2f}%')
-        if debug_show_progress_visuals:
+        if visual_debug_level >= VISUAL_DEBUG_PROGRESS:
             draw_border(get_do(), rooms[-1], get_debug_color(fragment.fragment_value), thickness=2)
 
     return rooms
@@ -294,7 +294,7 @@ def detect_dialogue_buttons(pixels, screen_size):
         if rect_fraction < min_dialogue_button_border_fraction: continue
 
         # progress_log(f'Detected dialogue button: {fragment.bounds}')
-        if debug_show_progress_visuals:
+        if visual_debug_level >= VISUAL_DEBUG_PROGRESS:
             draw_border(get_do(), fragment.bounds, np.array([200, 25, 10, 255], dtype=np.uint8), 4)
 
         detected.append(fragment)
@@ -312,6 +312,7 @@ def compute_loot_masks(frame1, frame2):
 
     return color_diff, unsigned_color_diff, any_changes, color_score
 
+# TODO: at some point really need to figure how to filter out a single matching pixel with no other matches around it
 def detect_generic_loot(frame1, frame2, color_diff, unsigned_color_diff, any_changes, color_score):
     frame_color_score = np.mean(frame2, axis=2)
 
@@ -330,7 +331,7 @@ def detect_generic_loot(frame1, frame2, color_diff, unsigned_color_diff, any_cha
     brightness_filter = box_blur((frame_color_score > 200) & (frame2[:,:,0] == 255), 7).squeeze() > 0
     
     convolved_match = box_blur(color_score_biased, 3).squeeze()
-    filtered_match = convolved_match > 0.17
+    filtered_match = convolved_match > 0.20
     # convolved_match = box_blur(color_score_biased, 5).squeeze()
     # filtered_match = convolved_match > 0.07
 
@@ -464,10 +465,11 @@ def detect_loot(scan_bounds, grab_screen_func=None, frames=None):
 
     # generic loot
     generic_loot_match = detect_generic_loot(frame1, frame2, color_diff, unsigned_color_diff, any_changes, color_score)['result']
-    result_log(f'General loot detection: {np.any(generic_loot_results)}')
+    result_log(f'Generic loot detection: {np.any(generic_loot_match)}')
 
     # corpse loot
     corpse_loot_match = detect_corpse_loot(frame1, frame2, color_diff, unsigned_color_diff, any_changes, color_score)['result']
+    corpse_loot_match[:frame1.shape[0] // 3,:] = False # hack to ignore loot in top third (it shouldn't be there)
     result_log(f'Corpse loot detection: {np.any(corpse_loot_match)}')
 
     # collection (?)

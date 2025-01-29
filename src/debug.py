@@ -7,8 +7,13 @@ debug_log_images = True
 debug_show_progress_log = True
 debug_show_result_log = True
 
-debug_show_result_visuals = True
-debug_show_progress_visuals = True
+VISUAL_DEBUG_NONE = 0
+VISUAL_DEBUG_RESULT = 1
+VISUAL_DEBUG_PROGRESS = 2
+
+visual_debug_level = VISUAL_DEBUG_RESULT
+extra_visual_debug = True
+
 log_limit = 10000000
 
 current_log = []

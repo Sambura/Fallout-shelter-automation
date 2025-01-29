@@ -476,6 +476,11 @@ def compute_img_diff_ratio(img1, img2, get_mask=False):
     ratio = np.sum(diff_mask) / np.prod(img1.shape[:2])
     return (ratio, diff_mask) if get_mask else ratio
 
+def compute_diff_magnitude(img1, img2):
+    "Computes a number assessing the difference between two frames, both by pixel count and color change (0 to 255)"
+    diff = np.abs(img1.astype(float) - img2)
+    return np.sum(diff) / np.prod(img1.shape)
+
 def compute_motion_diff(old_frame, current_frame, future_frame, diff_threshold=None):
     "Specify integer threshold to ignore too small changes"
     if diff_threshold is None:

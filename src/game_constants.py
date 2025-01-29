@@ -41,7 +41,7 @@ room_reached_min_diff = 0.8
 room_analysis_timeout = 5
 
 # Room scanning
-structural_scan_begin_timeout = 3
+structural_scan_begin_timeout = 1.5
 
 # Structural room detection
 struct_min_room_pixels = 400
@@ -72,3 +72,9 @@ character_panel_min_low_pixels = 15000
 
 objective_panel_primary_color = np.array([203, 201, 163])
 objective_panel_min_pixels = 200000
+
+# mouse interactions
+
+double_click_activation_radius = 38 # presumably is floor(screen_width / 50)
+safe_mouse_click_delay = 0.35 # seconds between clicks to not trigger double click
+mouse_click_duration = 0.12 # how long should a mouse button be held during a click
