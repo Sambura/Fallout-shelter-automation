@@ -23,7 +23,7 @@ def slow_loop(interval, max_iter_count=None, max_duration=None):
         current_time = perf_counter()
         yield i
         last_yield_time = perf_counter()
-        sleep(max(0, interval - (current_time - last_yield_time)))
+        sleep(max(0, interval - (last_yield_time - current_time)))
         i += 1
         if i >= max_iter_count: return
         if perf_counter() - start_time >= max_duration: return

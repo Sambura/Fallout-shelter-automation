@@ -18,11 +18,15 @@ antirad_min_clean_colors = 0.8
 levelup_color_ratio = 0
 levelup_min_clean_colors = 0.8
 color_ratio_tolerance = 0.15
-critical_cue_color = np.array([253, 222, 0])
-critical_cue_fragment_min_pixels = 25
-critical_hit_color = np.array([18, 244, 21])
-min_critical_pixels = 50
-critical_progress_color = np.array([251, 220, 0])
+
+# critical hits
+critical_cue_color = np.array([253, 222, 0]) # primary color of critical hit button (before and during activation)
+critical_cue_fragment_min_pixels = 25        # for cue fragment detection
+critical_hit_color = np.array([18, 244, 21]) # color of critical cue when max multiplier is reached
+min_critical_pixels = 75                     # min number of cue/critical pixels to detect a crit
+critical_progress_color = np.array([251, 220, 0]) # when crit is in progress, its center part has this color instead of critical_cue_color
+crit_max_duration = 10      # in seconds, duration of time during which it is possible to score a crit after its activation
+
 structural_color = np.array([0, 0, 0])
 enemy_healthbar_border_color = np.array([255, 25, 25])
 enemy_healthbar_color_max_deviation = 8
@@ -42,6 +46,10 @@ room_analysis_timeout = 5
 
 # Room scanning
 structural_scan_begin_timeout = 1.5
+
+# Structural detection
+structural_min_pixels = 1000    # min pixel count in fragment to count as structural
+structural_min_size = 100       # width OR height should be at least this large to count as structural 
 
 # Structural room detection
 struct_min_room_pixels = 400

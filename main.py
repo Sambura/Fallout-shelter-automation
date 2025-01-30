@@ -19,10 +19,11 @@ from random import randrange
 import cv2
 import itertools
 import argparse
+import psutil
 
 def visualize_fragment_grouping(fragments_mask, radius=40):
     create_debug_frame()
-    fragments, _, _ = detect_fragments(fragments_mask, fragments_mask, patch_mask=True)
+    fragments, _, _ = detect_fragments(fragments_mask, fragments_mask)
 
     for fragment in fragments:
         draw_circle(get_do(), fragment.bounds.pos, radius, np.array([255,255,255,255]))
@@ -103,35 +104,23 @@ def match_room_with_structural(structural_rooms, room_bounds):
 #   - make camera pan speed adaptive (traveled distance vs expected, adjust velocity)
 #       + This is likely only possible if the room navigation is reworked (fullscreen analysis / pan frames analysis)
 #       + Otherwise it is very hard to determine the reason of camera velocity mismatch as well as accurately keep track of the target room
-#   
-#   - when collecting loot, avoid clicking the same location on two separate iterations - try applying a random offset maybe? (reset on loot collection detection)
-#   - when analyzing crit frames, look for non-crit color to confirm we are still doing a crit
-#   - look into filtering crit hit timings. e.g. it should work even if one of the crits was missed and we got diffs like [0.5, 0.5, 1, 0.5]
-#   - add crit validation? (make sure the click went through, otherwise click again) [+ check if it was 5x or no by color]
-#   - [might not be needed] modify loot detection: if a loot is consistently detected at a location but is failed to be collected, increase number of attempts, assuming loot detection is correct
-#   - factor out loot collection in an independent routine. Run it from room analysis as well
-#   - Scan for new rooms during room analysis to account for new info (delayed room reveal)   
 #
-#   - look into optimizing detect_fragments (isn't it iterating over a list of coords? not ideal)
-#       + make function iterate_fragments ? will allow to stop analysis once a suitable fragment is found (structural detection, hint-hint)
-# 
-#   - add a new chord starter for debug functions (?)
+#   - [might not be needed] modify loot detection: if a loot is consistently detected at a location but is failed to be collected, increase number of attempts, assuming loot detection is correct
+#
+#   - add a new chord starter for debug functions (?????)
 #
 #  big things:
 #   - detect both enemy and ally health/rad levels. detect enemy boss icon
 #   - improve loot detection/collection: if no loot is detected, pan camera to look at a different angle
 #   - look into tracking camera location at all times, building an internal map of the scene to gain better understanding of the game
 #
-#  lol:
-#   - add CPU monitor because of how much threads we are running
-#
 # bugs(?):
 #   - after dialogue / battle, look for `mission complete` pop up to avoid accidentally clicking on it (may be unnecessary if loot will not be searched in top half) 
 #        - fun fact, you can also know the mission is complete by looking at topright button - there will be an exclamation mark if mission is complete
 #   - note: `objective complete` popups are not clickable, no need to look for them i think
 #
-#   - add check for UI panels during combat? if character panel opens, no one closes it as of now
-#   - after a dialogue choice is made, make sure to click the screen a couple of times (if the dialogue is still on, to skip the finishing lines)
+#   - after a dialogue choice is made, make sure to click the screen a couple of times (this should be happening, need to double check in-game)
+#  (if the dialogue is still on, to skip the finishing lines)
 #   
 
 ###
@@ -140,19 +129,21 @@ def match_room_with_structural(structural_rooms, room_bounds):
 
 class FalloutShelterAutomationApp:
     # constants (?)
-    version = 'v0.6.0'
+    version = 'v0.7.0'
     app_update_interval_ms: int = 20
     "Controls how often does app make regular update iterations (e.g. updating displayed log, starting async tasks, etc.)"
     chord_start_sequence: str = '<ctrl>+f' # enter this key combination to start a chord
 
     # mission script parameters (game related)
-    camera_pan_deadzone_size: float = 0.025
+    camera_pan_deadzone_size: float = 0.04 # there are limits on how accurate you can pan camera using keys
     "Precision of camera panning - the center of the room should end up in a rectangle with dimensions camera_pan_deadzone_size * screen_shape"
     camera_default_pan_distance = 500 # pan_camera will use this distance if no arguments are supplied
-    camera_pan_velocity = 3400 # distance divided by this is approximate pan time  
+    camera_pan_velocity = 3300 # distance divided by this is approximate pan time  
     crit_wait_count = 4 # how many crits to see for data collection before striking?
     dialogue_mode: str = 'manual' # random / manual
     "Controls which dialog handler is used when selecting dialog option"
+    overlay_update_interval = 25 # how often should overlay image be updated (in update ticks)
+    logs_font_size = 8 # font size for on-screen logs
 
     # state attributes
     tick_counter = 0 # Counts the number of times FalloutShelterAutomationApp.update() was called
@@ -248,7 +239,7 @@ class FalloutShelterAutomationApp:
             direction, distance = self.direction_to_screen_center(room_bounds, blocked_direction)
             if direction is None: break
             if are_opposite_directions(last_direction, direction): 
-                distance_multiplier *= 0.8
+                distance_multiplier *= 0.35
 
             progress_log(f'Panning: {direction} for {distance}px ({int(100 * distance_multiplier)}%)')    
             self.pan_camera(direction, distance=distance * distance_multiplier)
@@ -318,7 +309,12 @@ class FalloutShelterAutomationApp:
     def make_critical_strike(self, crit_bounds):
         grab_size = min(crit_bounds.width, crit_bounds.height) // 3
         grab_bounds = Bounds.from_center(crit_bounds.x, crit_bounds.y, grab_size, grab_size)
+        validation_bounds = grab_bounds.get_scaled_from_center(scale=10) # original bounds are too small, may miss the changes
         grab_bbox = grab_bounds.get_bbox()
+        validation_bbox = validation_bounds.get_bbox()
+
+        def get_cue_pixel_count(pixels):
+            return np.sum(match_color_exact(pixels, critical_cue_color)) + np.sum(match_color_exact(pixels, critical_progress_color))
 
         progress_log(f'Collecting timings...')
         
@@ -326,9 +322,9 @@ class FalloutShelterAutomationApp:
         hit_timings = [] # [(crit_start, crit_end), ...]
         last_i = -2 # does not have to be -2, any negative (except -1) will do the same
         restore_overlay = False
+        overlay_disabled = False
         capture_start = perf_counter()
-        # increase max duration later (how long is it again?)
-        for i, (frame, timestamp) in enumerate(self.iterate_latest_frames(max_duration=4, yield_timestamp=True)):
+        for i, (frame, timestamp) in enumerate(self.iterate_latest_frames(max_duration=crit_max_duration - 1.5, yield_timestamp=True)):
             crop = crop_image(frame, grab_bbox)
             crit_pixels = np.sum(match_color_exact(crop, critical_hit_color))
             if crit_pixels >= min_critical_pixels:
@@ -339,13 +335,18 @@ class FalloutShelterAutomationApp:
                 last_i = i
                 crit_frames_debug.append((frame, timestamp))
 
-                # TODO: wait until the end of the last crit before breaking?
                 if len(hit_timings) >= self.crit_wait_count:
                     break
+            else: # make sure we are even doing a crit right now
+                cue_pixels = get_cue_pixel_count(crop)
+                if cue_pixels < min_critical_pixels:
+                    debug_log_image(frame, 'crit-abort')
+                    progress_log('Aborting crit, no matching pixels')
+                    break
             
-            # TODO: fix this
-            if (perf_counter() - capture_start >= 1.5 or len(hit_timings) + 1 == self.crit_wait_count) and not restore_overlay:
+            if len(hit_timings) + 1 == self.crit_wait_count and not overlay_disabled:
                 restore_overlay = self.hide_overlay()
+                overlay_disabled = True
 
         if len(hit_timings) < 2: # because need at least 2 timings to get time delta
             progress_log('Crit failed: not enough data')
@@ -355,30 +356,58 @@ class FalloutShelterAutomationApp:
         diffs = [y[0] - x[1] for x, y in zip(hit_timings[:-1], hit_timings[1:])]
         avg_diff = np.median(diffs) # median should "filter out" outliers, unlike mean
         std_diff = np.std(diffs)
-        if std_diff > 0.02:
-            result_log(f'Warning: high timing deviation ({1000 * std_diff:0.2f} ms)')
+        progress_log(f'Crit diff info gathered: {[f"{x:0.2f}" for x in diffs]}, avg: {avg_diff:0.2f}s, std: {std_diff:0.4f}')
+        if std_diff > 0.02: result_log(f'Warning: high timing deviation')
 
         # calculate next crit time
         next_crit = hit_timings[-1][0]
-        for _ in range(10): # limit the iteration number
-            if next_crit < perf_counter(): 
-                next_crit += avg_diff
+        crit_scored = False
+        best_score = False
 
-        # next_crit -= 0.03 # bias
-        while perf_counter() < next_crit: sleep(0.0001)
-    
-        self.mouse_input.press(mouse.Button.left)
-        sleep(0.08)
-        self.mouse_input.release(mouse.Button.left)
-    
-        progress_log(f'Crit diff info gathered: {[f"{x:0.2f}" for x in diffs]}, avg: {avg_diff:0.2f}s, std: {std_diff:0.4f}')
+        # loop in case a click doesn't go through the first time :)
+        while not crit_scored and perf_counter() - capture_start < crit_max_duration:
+            for _ in range(15): # limit the iteration number
+                if next_crit < perf_counter(): 
+                    next_crit += avg_diff
+
+            # next_crit -= 0.03 # bias
+            while perf_counter() < next_crit: pass
+
+            self.mouse_input.press(mouse.Button.left)
+            sleep(0.08)
+            self.mouse_input.release(mouse.Button.left)
+
+            # determine crit type and verify the click went through
+            validation_frame = crop_image(self.latest_frame, validation_bbox)
+            ref_miss_pixels = get_cue_pixel_count(crop)
+            ref_hit_pixels = np.sum(match_color_exact(validation_frame, critical_hit_color))
+            if ref_miss_pixels < min_critical_pixels and ref_hit_pixels < min_critical_pixels:
+                result_log(f'Error: no crit pixels detected to verify ({ref_miss_pixels}/{ref_hit_pixels})')
+                break
+
+            best_score = ref_hit_pixels >= min_critical_pixels
+            crit_scored = True
+
+            for _ in slow_loop(interval=0.03, max_duration=0.35):
+                validation_frame = crop_image(self.latest_frame, validation_bbox)
+                miss_pixels = get_cue_pixel_count(crop)
+                hit_pixels = np.sum(match_color_exact(validation_frame, critical_hit_color))
+
+                if miss_pixels != ref_miss_pixels or hit_pixels != ref_hit_pixels: 
+                    crit_scored = False
+                    progress_log('Failed to verify crit, retrying')
+                    break
+
+        if crit_scored:
+            result_log(f'Crit scored! is x5: {best_score}')
+        else:
+            result_log('Failed to score a crit...')
 
         self.show_overlay(restore_overlay)
-        finish_time = perf_counter()
         for frame, timestamp in crit_frames_debug:
             debug_log_image(frame, f'crit-frame-{timestamp-crit_frames_debug[0][1]:0.2f}')
 
-        sleep(max(0, 2 - perf_counter() + finish_time)) # wait for crit message to disappear
+        sleep(max(0, 2 - perf_counter() + next_crit)) # wait for crit message to disappear
 
     def battle_iteration(self):
         "Freeze frame before calling"
@@ -392,7 +421,8 @@ class FalloutShelterAutomationApp:
         for bounds in crits:
             progress_log('Clicking crits...')
             self.mouse_click(bounds.x, bounds.y)
-            sleep(0.3)
+            # idk why it was there, let's try without it
+            # sleep(0.3)
             self.make_critical_strike(bounds)
     
         return len(meds) > 0, len(crits) > 0
@@ -610,28 +640,32 @@ class FalloutShelterAutomationApp:
 
         self.next_frame() # wait a bit for room to appear
         debug_log_image(self.freeze_frame(), "room-analysis-start")
-        self.early_loot_coords = None
         self.enemies_detected = False
         self.dialogue_detected = False
         self.loot_bound_detected = True
-        self.early_loot_collect_triggered = False
+        self.loot_collected = False
+        self.loot_collection_cancelled = False
+        self.new_room_detected = False
+        room_analysis_timeout = 7
 
         # first thing we do - check if there is a new room appeared. If so, collect loot in current room
-        new_rooms = detect_rooms(self.fixed_frame)
-        if has_new_room(new_rooms, self.last_detected_rooms):
-            progress_log('Room analysis: new room')
-            self.script_state = self.loot_collection_state
-            return
+        def room_detection_task():
+            state_index = self.state_index
+            for _ in slow_loop(interval=0.5, max_duration=room_analysis_timeout):
+                if state_index != self.state_index: return # room analysis ended, return
+                new_rooms = detect_rooms(self.latest_frame)
+                if has_new_room(new_rooms, self.last_detected_rooms):
+                    progress_log('Room analysis: new room')
+                    self.new_room_detected = True
+                    return
 
-        # No new room detected, must be something else.
-        # probably the next best thing to do is figure out where dwellers came from into the room
-        # (ended up not using direction (and it is not accurate whatsoever))
-        # entry_direction = self.estimate_movement_direction(room_entry_frames) # ~1 second? idk
+        room_detection_thread = threading.Thread(target=room_detection_task)
+        room_detection_thread.start()
 
         # the enemies can appear at any point, just look for them in background
         self.run_enemy_detection = True
         def enemy_detection_task():
-            for _ in slow_loop(interval=0.5): # scan at most twice a second
+            for _ in slow_loop(interval=0.25): # scan at most four times a second
                 self.enemies_detected, self.current_enemies = detect_enemies(self.latest_frame)
                 if not self.run_enemy_detection or self.enemies_detected: 
                     if self.enemies_detected: progress_log('Interrupting: enemies detected')
@@ -659,13 +693,8 @@ class FalloutShelterAutomationApp:
         self.run_dialogue_detection = True
         dialogue_detection_thread = threading.Thread(target=dialog_detection_task)
         dialogue_detection_thread.start()
-
-        # we start loot detection as soon as structural is detected, wait for now...
-        loot_detection_thread = None
-        def loot_detection_task():
-            result_log('>> background loot detection in 1 s') # wait 1s for room fade-in
-            self.early_loot_coords = self.do_detect_loot(delay=1, debug_prefix='precapture-')
-            result_log(f'<< background loot detection ({len(self.early_loot_coords)})')
+        loot_collection_thread = None
+        loot_collection_delay = 2
 
         # ~~ EveNT lOoP ~~
         progress_log(f'Starting event loop...')
@@ -674,26 +703,27 @@ class FalloutShelterAutomationApp:
             if self.enemies_detected:
                 self.run_dialogue_detection = False
                 self.script_state = self.battle_state
+                self.loot_collection_cancelled = True
                 return
             if self.dialogue_detected: # leave enemy detection on
                 self.script_state = self.dialogue_state
                 # bounds change when entering the dialogue
                 self.loot_bound_detected = False
+                self.loot_collection_cancelled = True
                 progress_log(f'Detecting structural...')
-                structural_detection_thread = threading.Thread(target=lambda: self.structural_detection_task(delay=1.5))
+                # delay needed since room zoom in before dialogue needs time to complete
+                structural_detection_thread = threading.Thread(target=lambda: self.structural_detection_task(delay=1))
                 structural_detection_thread.start()
                 return
-            if self.loot_bound_detected and loot_detection_thread is None:
-                loot_detection_thread = threading.Thread(target=loot_detection_task)
-                loot_detection_thread.start()
-            elif self.early_loot_coords is not None and not self.early_loot_collect_triggered and perf_counter() - loop_start > 1:
-                # wait at least 1 second in case enemy fight is coming soon (?)
-                result_log(f'Collecting {len(self.early_loot_coords)} loot while waiting...')
-                # TODO: break this up into multiple iterations?
-                self.do_collect_loot(self.early_loot_coords)
-                self.early_loot_collect_triggered = True
+            if loot_collection_thread is None and perf_counter() - loop_start > loot_collection_delay:
+                loot_collection_thread = threading.Thread(target=self.loot_collection_task)
+                loot_collection_thread.start()
 
-            if perf_counter() - loop_start > 7:
+            if self.loot_collected and self.new_room_detected:
+                progress_log(f'Loot collected and new room detected, proceeding')
+                break # loot collection state is skipped if self.loot_collected is True
+
+            if perf_counter() - loop_start > room_analysis_timeout:
                 progress_log(f'Event loop timeout, proceed to looting')
                 break # wait up to 7 seconds for something, otherwise proceed to looting
         
@@ -708,19 +738,19 @@ class FalloutShelterAutomationApp:
         dialogue_finish_time = None
         for _ in slow_loop(interval=0.2):
             dialogue_choice, buttons = detect_dialogue_buttons(self.freeze_frame(), self.screen_shape_xy)
-            # debug_log_image(self.fixed_frame, 'dialogue-iteration-capture')
             if dialogue_choice:
                 progress_log('Dialog choice detected!')
                 progress_log(f'Starting handler: {self.dialogue_mode}')
                 debug_log_image(self.fixed_frame, 'dialogue-choice-capture')
                 self.dialogue_handlers[self.dialogue_mode](buttons)
+                continue
             if self.enemies_detected:
                 self.script_state = self.battle_state
                 return
             if detect_ui(self.fixed_frame):
                 if dialogue_finish_time is None:
                     dialogue_finish_time = perf_counter()
-                progress_log('Dialogue finished')
+                    progress_log('Dialogue finished')
                 if perf_counter() - dialogue_finish_time >= 3: # wait for potential enemies to appear
                     progress_log('Timeout, exiting dialogue')
                     self.script_state = self.loot_collection_state
@@ -731,27 +761,44 @@ class FalloutShelterAutomationApp:
 
     def battle_state(self):
         have_enemies = True
-        while have_enemies:
+
+        def ui_closer_task():
+            state_index = self.state_index
+            for _ in slow_loop(interval=1):
+                if self.state_index != state_index: return
+                self.hide_ui_panels()
+        
+        ui_closer_thread = threading.Thread(target=ui_closer_task)
+        ui_closer_thread.start()
+
+        last_enemy_detection = perf_counter()
+        # this is around how long we should wait for enemy death animations anyway
+        enemy_wait_timeout = 3
+
+        while perf_counter() - last_enemy_detection < enemy_wait_timeout:
             debug_log_image(self.freeze_frame(), 'battle-iteration-capture')
             had_meds, had_crits = self.battle_iteration() # take care of meds / crits
-            if had_crits: 
-                self.hide_ui_panels()
-                continue # critical hit marker can obscure enemies and they go undetected
+            if had_crits: continue # critical hit marker can obscure enemies and they go undetected
 
             have_enemies, enemies = detect_enemies(self.fixed_frame)
             progress_log(f'BIT: {len(enemies)} enemies detected')
+
+            if have_enemies: last_enemy_detection = perf_counter()
         
-        sleep(3) # wait for enemy death animation (idk how accurate is this number)
         self.script_state = self.loot_collection_state
 
-    def hide_ui_panels(self):
-        if detect_character_panel(self.latest_frame) or detect_objective_panel(self.latest_frame):
-            self.mask_escape_key = True
-            self.keyboard_input.press(keyboard.Key.esc)
-            sleep(0.03)
-            self.keyboard_input.release(keyboard.Key.esc)
-            self.mask_escape_key = False
-            sleep(0.2) # character panel hide animation (is probably longer)
+    def hide_ui_panels(self, return_immediately=False):
+        "Returns True if there were UI panels to be closed"
+        if not detect_character_panel(self.latest_frame) and not detect_objective_panel(self.latest_frame):
+            return False
+
+        self.mask_escape_key = True
+        self.keyboard_input.press(keyboard.Key.esc)
+        sleep(0.03)
+        self.keyboard_input.release(keyboard.Key.esc)
+        self.mask_escape_key = False
+        if not return_immediately: sleep(0.2) # character panel hide animation (is probably longer)
+        return True
 
     def do_collect_loot(self, loot_coords):
         for loot in loot_coords: 
@@ -765,51 +812,84 @@ class FalloutShelterAutomationApp:
             debug_log_image(frame, f'{debug_prefix}loot-detection-frame-{i}')
         return detect_loot(self.current_room_bounds, frames=frames)
 
-    def loot_collection_state(self):
-        progress_log(f'Proceeding to loot collection!')
-        scan_attempts = 2
+    def filter_loot_coords(self, loot_coords):
+        "Modifies coordinates to avoid clicking the same spots we already clicked"
+        filter_radius = 9
 
-        if self.dialogue_detected or self.enemies_detected:
-            scan_attempts += 1
-            if self.early_loot_collect_triggered:
-                progress_log('Keeping precomputed loot coords...')
+        if len(self.loot_click_locations) == 0: 
+            self.loot_click_locations += loot_coords
+            return loot_coords
 
-            if self.dialogue_detected: # because bounds change, and computed coords are no longer valid
-                # while it may be possible to remap coordinates with known old and new bounds, it is worth asking if it is even possible to
-                # detect loot before dialog properly (i.e. is there enough time?)
-                self.early_loot_coords = None
-        elif self.early_loot_collect_triggered:
-            progress_log('Precomputed loot coords used, discarding...')
-            self.early_loot_coords = None
+        filtered_coords = []
+        for point in loot_coords:
+            matches = np.linalg.norm(np.array(self.loot_click_locations) - point, axis=1) <= filter_radius
+            if np.any(matches):
+                ox, oy = point
+                search_radius = 5
+                progress_log(f'Warning: modifying loot point {point}')
+
+                while True:
+                    search_space = np.ones((search_radius * 2 + 1, search_radius * 2 + 1), dtype=bool)
+
+                    # limit search space to a circle shape
+                    yy, xx = np.ogrid[-search_radius:search_radius + 1, -search_radius:search_radius + 1]
+                    mask = xx ** 2 + yy ** 2 > search_radius ** 2
+                    search_space[mask] = False
+
+                    # mask out all the clicked spots
+                    for clicked_point in self.loot_click_locations:
+                        x, y = clicked_point
+                        dx, dy = ox - x, oy - y
+                        yy, xx = np.ogrid[dy - search_radius:dy + search_radius + 1, dx - search_radius:dx + search_radius + 1]
+                        mask = xx ** 2 + yy ** 2 <= filter_radius ** 2
+                        search_space[mask] = False
+
+                    ys, xs = search_space.nonzero()
+                    if len(xs) == 0:
+                        search_radius = int(search_radius * 1.35)
+                        continue
+
+                    index = randrange(len(xs))
+                    point = (xs[index] + ox - search_radius, ys[index] + oy - search_radius)
+                    break
+            
+            filtered_coords.append(point)
+            self.loot_click_locations.append(point)
+
+        return filtered_coords
+
+    def loot_collection_task(self):
+        progress_log(f'Starting loot collection')
+        # enemies leave more loot, increase attempt count
+        scan_attempts = 3 if self.enemies_detected else 2
+
+        self.loot_click_locations = []
 
         if not self.loot_bound_detected:
             progress_log(f'Waiting for loot bound detection...')
             while not self.loot_bound_detected: sleep(0.1)
 
+        # TODO: figure out whether we want to delay loot collection if hide_ui_panels returns true (for panels to not be in frames)
         self.hide_ui_panels()
         draw_border(get_do(), self.current_room_bounds, np.array([255, 0, 0, 255]), thickness=5)
         for attempt in range(15): # hard cap attempt count at 15
             progress_log(f'Scan attempt: #{attempt + 1}')
-            
-            if self.early_loot_coords:
-                progress_log(f'Using precomputed loot data...')
-                loot_coords = self.early_loot_coords
-                self.early_loot_coords = None # do not reuse them twice!
-            else:
-                # only wait for frames on first iteration, subsequent delay is built in the loop
-                loot_coords = self.do_detect_loot()
 
+            loot_coords = self.do_detect_loot()
             scan_attempts -= 1
+
             if len(loot_coords) == 0:
                 if scan_attempts < 1: break
-                sleep(0.25) # small delay to get new frames (?)
+                sleep(0.25) # small delay to get new frames
                 continue
-
+            
+            loot_coords = self.filter_loot_coords(loot_coords)
+            if self.loot_collection_cancelled: return
             self.do_collect_loot(loot_coords)
             loot_collection_stop_time = perf_counter()
 
             # try to detect loot pickup animation. Timeout: 3.5s since after that delay all animations finish
-            frame_iterator = self.iterate_latest_frames(min_frame_delta=0.2, yield_timestamp=True, include_oldest=True, max_runtime=3.5)
+            frame_iterator = self.iterate_latest_frames(min_frame_delta=0.2, yield_timestamp=True, max_runtime=3.5)
             last_frame = next(frame_iterator)[0]
             loot_collected = False
             for frame, timestamp in frame_iterator:
@@ -821,7 +901,7 @@ class FalloutShelterAutomationApp:
                     break
 
                 magnitude = compute_diff_magnitude(frame, last_frame)
-                progress_log(f'Looking for diff spike: {magnitude} : {timestamp - loot_collection_stop_time} s')
+                # progress_log(f'Looking for diff spike: {magnitude} : {timestamp - loot_collection_stop_time} s')
                 # seen magnitude as low as 0.72
                 if magnitude > 0.95:
                     progress_log(f'<Loot collection confirmed: {magnitude:0.1f}>')
@@ -829,13 +909,21 @@ class FalloutShelterAutomationApp:
                     debug_log_image(frame, f'loot-collected-new-frame')
                     scan_attempts += 1 # always good to retry until no loot is left
                     loot_collected = True
+                    self.loot_click_locations = []
                 last_frame = frame
             
+            if self.loot_collection_cancelled: return
             self.hide_ui_panels() # doing the last to not influence diff detection
             if scan_attempts < 1: break
-
-        self.script_state = self.room_scan_state
+        
+        self.loot_collected = True
     
+    def loot_collection_state(self):
+        if not self.loot_collected:
+            self.loot_collection_cancelled = False
+            self.loot_collection_task()
+        self.script_state = self.room_scan_state
+
     def mission_script(self):
         progress_log('>>> Starting mission script')
 
@@ -845,6 +933,7 @@ class FalloutShelterAutomationApp:
         self.room_scan_retry_start = None               # start with normal room detection
         self.last_iteration_room_detected = False       # has an unvisited room been detected on previous iteration?
         self.script_state = self.room_scan_state        # current state function of the mission script
+        self.state_index = 0                            # increments each time we switch the state
         self.mission_paused = False
 
         progress_log('>>> Starting capture thread')
@@ -854,14 +943,17 @@ class FalloutShelterAutomationApp:
         self.zoomed_out = False
         self.need_zoom_out = True
 
+        last_state = None
         progress_log('>>> Mission loop starts')
         while not self.script_complete:
             if self.mission_paused:
                 progress_log('>>> Script is paused now')
                 while self.mission_paused: sleep(0.1)
                 progress_log('>>> Resuming the mission script')
-                
+            
+            last_state = self.script_state
             self.script_state()
+            if self.script_state is not last_state: self.state_index += 1
 
         self.state_overlay = self.state_overlay_mission_complete
         self.update_overlay()
@@ -988,7 +1080,7 @@ class FalloutShelterAutomationApp:
     ### App initialization
     ###
 
-    def __init__(self, force_pil_capture=False, mock_frames_path=None):
+    def __init__(self, force_pil_capture=False, mock_frames_path=None, disable_image_logging=False):
         self.dialogue_handlers = {
             'random': self.dialogue_random_handler,
             'manual': self.dialogue_manual_handler
@@ -998,7 +1090,7 @@ class FalloutShelterAutomationApp:
         self.execution_target_chord_map = {
              # replace with whatever you need at the time
             # '`': (lambda x: debug_detect_generic_loot(grab_screen_func=x.no_overlay_grab_screen, mock_mode=self.mock_mode), 'temp debug function', False),
-            '`': (FalloutShelterAutomationApp.debug_test_double_click, 'temp debug function', False),
+            '`': (FalloutShelterAutomationApp.debug_test_loot_click_dispersion, 'temp debug function', False),
             'm': (lambda x: detect_med_buttons(x.no_overlay_grab_screen()), 'meds detection', True),
             'c': (lambda x: detect_critical_button(x.no_overlay_grab_screen()), 'critical cue detection', True),
             'r': (lambda x: detect_rooms(x.no_overlay_grab_screen()), 'rooms detection', True),
@@ -1026,12 +1118,14 @@ class FalloutShelterAutomationApp:
         self.mouse_input = mouse.Controller()
         self.recent_click_coords = []
         self.recent_click_timestamps = []
+        self.loot_click_locations = []
 
         self.max_screen_frames = 250                     # kind of arbitrary (~1500 MB for 1920x1080 frames)
         self.screen_frame_max_age = 3                    # (seconds) (probably can be reduced, 3 seconds for debug reasons)
         self.capture_thread = None
         self.force_pil_capture = force_pil_capture
         self.mock_frames_path = mock_frames_path
+        self.disable_image_logging = disable_image_logging
 
     def run(self):
         print('Welcome to FSA! Initializing...')
@@ -1047,6 +1141,8 @@ class FalloutShelterAutomationApp:
         else:
             self.grab_screen, self.native_grab_screen = init_screen_capture(mode='real', window_title='Fallout Shelter', use_native=native_capture)
             self.set_screen_shape(np.array(self.grab_screen(None).shape[:2]))
+            if self.disable_image_logging:
+                set_debug_log_images_enabled(enabled=False)
 
         if self.native_grab_screen:
             self.no_overlay_grab_screen = self.grab_screen
@@ -1057,28 +1153,43 @@ class FalloutShelterAutomationApp:
             self.no_overlay_grab_screen = self.grab_screen
             result_log('Mock screen capture initialized')
 
-        if not self.mock_mode: init_output_directory()
+        if not self.mock_mode and not self.disable_image_logging: init_output_directory()
+
+        # Initialize UI
         self.root = tk.Tk()
         self.root.attributes('-fullscreen', True)
         self.root.attributes('-transparentcolor','#f0f0f0')
         self.root.attributes("-topmost", True)   
 
+        self.panel = tk.Label(self.root)
+        self.log_label = tk.Label(self.root, text='Error text...', background='#000000', foreground='#44dd11', justify='left', font=('Segoe UI', self.logs_font_size))
+        self.log_label.pack(side=tk.LEFT)
+
+        self.status_label = tk.Label(self.root, text='<no data>', background='#000000', foreground='#d0d0d0', justify='right', font=('Segoe UI', self.logs_font_size))
+        self.status_label.pack(side=tk.BOTTOM, anchor=tk.SE)
+
+        if os.path.exists('./resources/test_overlay.png'):
+            with Image.open('./resources/test_overlay.png') as img:
+                self.update_overlay(np.array(img.resize(self.screen_shape_xy)))
+        else:
+            self.update_overlay(np.zeros(self.screen_shape, dtype=np.uint8))
+
+        # Start background workers
+        self.keyboard_listener_thread = threading.Thread(target=self.keyboard_listener)
+        self.keyboard_listener_thread.start()
+
+        self.status_label_thread = threading.Thread(target=self.status_label_worker)
+        self.status_label_thread.start()
+
+        self.root.after(self.app_update_interval_ms, self.update)
+        
+        # Start
         log(f'\n' \
             f'Fallout Shelter Automation: {self.version}\n' \
             f'Start mission script: Ctrl + F; Enter (Esc to terminate)\n' \
             f'Toggle log display: Ctrl + F; L\n' \
             f'Shutdown: Ctrl + F; Esc \n')
 
-        self.panel = tk.Label(self.root)
-        self.log_label = tk.Label(self.root, text='Error text...', background='#000000', foreground='#44dd11', justify='left')
-        self.log_label.pack(side='left')
-
-        with Image.open("./resources/test_overlay.png") as img:
-            self.update_overlay(np.array(img.resize(self.screen_shape_xy)))
-        self.keyboard_listener_thread = threading.Thread(target=self.keyboard_listener)
-        self.keyboard_listener_thread.start()
-
-        self.root.after(self.app_update_interval_ms, self.update)
         self.root.mainloop()
 
     def set_screen_shape(self, screen_shape_yx):
@@ -1123,6 +1234,7 @@ class FalloutShelterAutomationApp:
 
     def hide_overlay(self): 
         "Disables FSA overlay and on-screen logs regardless of current state. Returns bool: whether overlay was enabled before this call"
+        # should we also hide status label? surely not
         self.panel.place_forget()
         self.log_label.pack_forget()
         was_on = self.overlay_on
@@ -1234,7 +1346,7 @@ class FalloutShelterAutomationApp:
 
         self.root.after(self.app_update_interval_ms, self.update)
         self.tick_counter += 1
-        if self.tick_counter % 25 == 0: self.display_debug()
+        if self.tick_counter % self.overlay_update_interval == 0: self.display_debug()
 
         self.log_label.config(text=get_current_log())
         if self.current_execution_target is not None and not self.task_in_progress:
@@ -1364,6 +1476,36 @@ class FalloutShelterAutomationApp:
         with keyboard.Listener(on_press=keyboard_on_press, on_release=keyboard_on_release) as l:
             l.join()
 
+    # CPU usage this function reports on my machine looks like it's randomly generated, but whatever, it's fun to look at i guess
+    def status_label_worker(self):
+        "Worker that updates status label"
+        this_process = psutil.Process(os.getpid())
+
+        # interval is smaller to terminate quickly
+        for i in slow_loop(interval=0.1):
+            if self.terminate_pending: return
+            if i % 10 != 0: continue
+            
+            status = '[Error]'
+            try:
+                system_cpu = psutil.cpu_percent()
+                process_cpu = this_process.cpu_percent() / psutil.cpu_count()
+                timing_string = f'CPU: {system_cpu:0.1f}% ({process_cpu:0.1f}%) [{threading.active_count()}]'
+                capture_string = ' capture: '
+                if self.capture_thread is None:
+                    capture_string += 'disabled'
+                else:
+                    frames = self.copy_frames_buffer(max_total_duration=2)
+                    fps = len(frames) / (frames[-1][1] - frames[0][1])
+                    capture_string += f'{fps:0.1f} FPS'
+
+                status = timing_string + capture_string
+            except:
+                print('Status worker error:')
+                traceback.print_exc()
+            
+            self.status_label.config(text=status)
+
     ####
     #### Debug functions
     ####
@@ -1373,11 +1515,19 @@ class FalloutShelterAutomationApp:
         progress_log(f'Mock frames from: {Path(get_current_mock_path()).name}')
 
     def next_mock_frame_directory(self):
+        if not self.mock_mode:
+            result_log('Warning: Not in mock mode')
+            return
+            
         load_next_mock_path()
         self.set_screen_shape(np.array(get_mock_frames()[0].shape[:2]))
         self.log_mock_frames_path()
     
     def prev_mock_frame_directory(self):
+        if not self.mock_mode:
+            result_log('Warning: Not in mock mode')
+            return
+
         load_next_mock_path(previous=True)
         self.set_screen_shape(np.array(get_mock_frames()[0].shape[:2]))
         self.log_mock_frames_path()
@@ -1526,7 +1676,7 @@ class FalloutShelterAutomationApp:
         draw_border(get_do(), bounds1, np.array([0, 0, 0, 255]), 1)
         img = self.no_overlay_grab_screen()
         mask = np.all(img == np.array([0, 255, 0]), axis=2)
-        fragments, _, _, _ = detect_fragments(mask, mask)
+        fragments, _, _, _ = detect_fragments(mask, mask, point_count=True)
         bounds2 = None
         last_size = 0
         for frag in fragments:
@@ -1548,7 +1698,17 @@ class FalloutShelterAutomationApp:
         for _ in range(50):
             x, y = randrange(820, 980), randrange(820, 980)
             print(f'Clicking: {x}, {y}')
-            self.mouse_click(x, y,)
+            self.mouse_click(x, y)
+
+    def debug_test_loot_click_dispersion(self):
+        update_interval = self.overlay_update_interval
+        self.overlay_update_interval = 3
+        for _ in range(300):
+            point = self.filter_loot_coords([(450, 300)])[0]
+            print(f'New coords: {point}')
+            draw_disk(get_do(), point, 9, get_debug_color(randrange(100000000)))
+            sleep(0.05)
+        self.overlay_update_interval = update_interval
 
 ###
 ### static void main string args
@@ -1558,7 +1718,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Fallout shelter automation')
     parser.add_argument('--force-pil-capture', action='store_true', help='Force screen capture using PIL (no native window capturing)')
     parser.add_argument('--mock-frames-path', type=str, help='Specify directory for mock frames (also enables mock screen capture). Either provide path to folder with frames, or to folder of folders with frames')
+    parser.add_argument('--disable-image-logging', action='store_true', default=False, help='Disables logging images as files')
     args = parser.parse_args()
 
-    app = FalloutShelterAutomationApp(force_pil_capture=args.force_pil_capture, mock_frames_path=args.mock_frames_path)
+    app = FalloutShelterAutomationApp(force_pil_capture=args.force_pil_capture, mock_frames_path=args.mock_frames_path, disable_image_logging=args.disable_image_logging)
     app.run()

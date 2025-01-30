@@ -54,7 +54,7 @@ def load_mock_frames(path, mode='frames'):
             img_path = os.path.join(path, filename)
             img = Image.open(img_path)
             img_array = np.array(img)
-            frames.append(img_array)
+            frames.append(img_array[:,:,:3])
     
     print(f'Loaded {len(frames)} mock frames')
     set_mock_frames(frames, mode)
@@ -151,7 +151,7 @@ def finish_screen_capture():
     if __finish_func is not None:
         __finish_func()
 
-DEBUG_COLORS = (np.array([plt.get_cmap('rainbow')(i) for i in np.linspace(0, 1, 8)]) * 255).astype(int)
+DEBUG_COLORS = (np.array([plt.get_cmap('rainbow')(i) for i in np.linspace(0, 1, 12)]) * 255).astype(int)
 
 def get_debug_color(value):
     return DEBUG_COLORS[value % len(DEBUG_COLORS)]
@@ -189,9 +189,12 @@ class Bounds:
         y_min = y - height // 2
         return Bounds.from_rect(x_min, y_min, width, height)
 
-    def are_smaller_than(self, width, height=None):
+    def are_smaller_than(self, width, height=None, both_axes=False):
         "specify one argument to compare to a square"
         if height is None: height = width
+        if both_axes:
+            return self.width < width and self.height < height
+
         return self.width < width or self.height < height
 
     def from_points(*points):
@@ -264,18 +267,40 @@ class Bounds:
         return f'(Bounds) x: {self.x} y: {self.y}; {self.width}x{self.height}'
 
 class Fragment:
+    # apparently a lot of derivative attributes are pretty expensive to compute, hence we do not
     def __init__(self, source_pixels, mask, value, rect):
-        self.points = np.array(np.where(mask == value)).T
         self.fragment_value = value
-        self.point_count = len(self.points)
         self.bounds = Bounds.from_rect(*rect)
         self.source_pixels = source_pixels
+        self.source_mask = mask
 
-    def compute(self, source_patch=False, patch_mask=False, masked_patch=False):
-        if source_patch or masked_patch:
+        self.points = None
+        self.point_count = None
+        self.source_patch = None
+        self.patch_mask = None
+        self.masked_patch = None
+
+    def compute(self, source_patch=False, patch_mask=False, masked_patch=False, points=False, point_count=False):
+        if masked_patch: source_patch = patch_mask = True
+        if patch_mask: points = True
+        if points: point_count = True
+
+        if source_patch and self.source_patch is not None: source_patch = False
+        if patch_mask and self.patch_mask is not None: patch_mask = False
+        if masked_patch and self.masked_patch is not None: masked_patch = False
+        if points and self.points is not None: points = False
+        if point_count and self.point_count is not None: point_count = False
+        
+        if points:
+            self.points = np.array(np.nonzero(self.source_mask == self.fragment_value)).T
+
+        if point_count:
+            self.point_count = np.sum(self.source_mask == self.fragment_value) if self.points is None else len(self.points)
+
+        if source_patch:
             self.source_patch = self.source_pixels[self.bounds.to_slice()]
-
-        if patch_mask or masked_patch:
+        
+        if patch_mask:
             self.patch_mask = np.zeros((self.bounds.height, self.bounds.width), dtype=bool)
             self.patch_mask[self.points[:,0] - self.bounds.y_min, self.points[:,1] - self.bounds.x_min] = True
 
@@ -287,9 +312,13 @@ class Fragment:
 
     def unite_with(self, fragment):
         "Updates masked points and bounds. May break things since source_pixels may be too small after union"
+        self.compute(points=True)
+        fragment.compute(points=True)
+        self.point_count = None
         self.points = np.unique(np.concatenate((self.points, fragment.points)), axis=0)
         self.point_count = len(self.points)
         self.bounds = Bounds.from_points(*self.points[:, ::-1])
+        self.compute(point_count=True)
         self.masked_patch = self.source_patch = self.patch_mask = None
 
 def detect_fragment(pixels, x, y, mask, value, matching_mask):
@@ -449,8 +478,6 @@ def _is_fragment_rectangular(patch_mask):
         mask_ones_count = rect_mask.shape[0] + rect_mask.shape[1] - 1
     else:
         mask_ones_count = 2 * (rect_mask.shape[0] + rect_mask.shape[1] - 2)
-    mask_ones_count2 = np.sum(rect_mask) # probably can be removed
-    if mask_ones_count != mask_ones_count2: raise 'wtf'
 
     matching_pixels = np.sum(np.logical_and(patch_mask, rect_mask))
  
@@ -458,7 +485,7 @@ def _is_fragment_rectangular(patch_mask):
 
 def is_fragment_rectangular(fragment: Fragment, report_fraction=False):
     if fragment.bounds.area == 0: return None
-    if not hasattr(fragment, 'patch_mask'): fragment.compute(patch_mask=True)
+    fragment.compute(patch_mask=True)
 
     matching_fraction = _is_fragment_rectangular(fragment.patch_mask)
  

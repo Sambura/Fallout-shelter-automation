@@ -22,12 +22,11 @@ def get_room_type(room, loc):
     return 'elevator'
 
 # (room_type, location, bounds)
-@print_durations()
 def detect_rooms(pixels, return_fragments=False):
     create_debug_frame()
 
     def analyze_room(fragment):
-        fragment.compute(source_patch=True, patch_mask=True)
+        fragment.compute(source_patch=True, patch_mask=True, point_count=True)
         bounds = fragment.bounds
 
         total_border = fragment.point_count
@@ -78,7 +77,6 @@ def detect_rooms(pixels, return_fragments=False):
     return rooms_detected
 
 # (med_name, bounds)
-@print_durations()
 def detect_med_buttons(pixels):
     create_debug_frame()
     detected = []
@@ -98,7 +96,7 @@ def detect_med_buttons(pixels):
     levelup_check = get_icon_checker('Level-up', levelup_color_ratio, 0, levelup_min_clean_colors)
 
     fragments_mask = np.all(np.logical_and(pixels <= healing_color_high, pixels >= healing_color_low), axis=2)
-    fragments, _, _, mask = detect_fragments(pixels, fragments_mask, masked_patch=True)
+    fragments, _, _, mask = detect_fragments(pixels, fragments_mask, masked_patch=True, point_count=True)
 
     for fragment in fragments:
         low_color_count = np.sum(np.all(fragment.masked_patch == healing_color_low, axis=2))
@@ -129,13 +127,12 @@ def detect_med_buttons(pixels):
     return detected
 
 # bounds
-@print_durations()
 def detect_critical_button(pixels):
     create_debug_frame()
     fragments_mask = match_color_exact(pixels, critical_cue_color)
     if np.sum(fragments_mask) < critical_cue_fragment_min_pixels * 9: return [] # early stop
 
-    fragments, _, _, mask = detect_fragments(pixels, fragments_mask)
+    fragments, _, _, mask = detect_fragments(pixels, fragments_mask, point_count=True)
 
     for fragment in fragments[:]: # copy list
         if fragment.point_count < critical_cue_fragment_min_pixels:
@@ -173,7 +170,6 @@ def detect_critical_button(pixels):
 
     return detected
 
-@print_durations()
 def detect_structural(pixels):
     """Detects the structural (the black-colored area that surrounds all rooms)
     Works by finding all fragments comprised of exactly black pixels and selecting the largest of them
@@ -187,8 +183,14 @@ def detect_structural(pixels):
     fragments, _, _, mask = detect_fragments(pixels, fragments_mask)
 
     for fragment in fragments[:]: # copy list
-        if fragment.point_count < struct_min_room_pixels: 
-            fragments.remove(fragment); continue
+        if fragment.bounds.are_smaller_than(structural_min_size, both_axes=True): 
+            fragments.remove(fragment)
+            continue
+        
+        fragment.compute(point_count=True)
+        if fragment.point_count < structural_min_pixels: 
+            fragments.remove(fragment)
+            continue
         
         # progress_log(f'Detected structural fragment: {fragment.point_count} pixel count')
         if visual_debug_level >= VISUAL_DEBUG_PROGRESS:
@@ -198,22 +200,20 @@ def detect_structural(pixels):
 
     best_candidate = max(fragments, key=lambda x: x.point_count)
     obscured_directions = []
-    best_candidate.compute(patch_mask=True)
     if best_candidate.bounds.y_min == 0: obscured_directions.append('down')
     if best_candidate.bounds.y_max == pixels.shape[0] - 1: obscured_directions.append('up')
     if best_candidate.bounds.x_min == 0: obscured_directions.append('left')
     if best_candidate.bounds.x_max == pixels.shape[1] - 1: obscured_directions.append('right')
-
+    
     return best_candidate, obscured_directions
 
 # returns are_there_enemies, fragments
-@print_durations()
 def detect_enemies(pixels):
     create_debug_frame()
     fragments_mask = match_blending_pixels(pixels, enemy_healthbar_border_color, enemy_healthbar_outline_color, 
         enemy_healthbar_detect_blending, enemy_healthbar_color_max_deviation)
 
-    fragments, _, _, mask = detect_fragments(pixels, fragments_mask)
+    fragments, _, _, mask = detect_fragments(pixels, fragments_mask, points=True)
     detected = []
 
     for fragment in fragments:
@@ -225,7 +225,7 @@ def detect_enemies(pixels):
         if is_fragment_rectangular(fragment):
             detected.append(fragment)
             if visual_debug_level >= VISUAL_DEBUG_RESULT:
-                get_do()[mask == fragment.fragment_value] += np.array([50, 255, 20, 255])
+                get_do()[mask == fragment.fragment_value] += np.array([230, 190, 40, 255])
 
     return len(detected) > 0, detected
 
@@ -234,13 +234,12 @@ def detect_enemies(pixels):
 # ended up not using this :( 
 # primary problem is that sometimes some text appears above characters
 # and messes up with structural detection
-@print_durations()
 # TODO: small bumps on room bounds can lead to detection of too large room (e.g. text overlaps with structural)
 # fix that at some point....
 def detect_structural_rooms(structural: Fragment):
     if structural is None: return []
     create_debug_frame()
-    if not hasattr(structural, 'patch_mask'): structural.compute(patch_mask=True)
+    structural.compute(patch_mask=True)
     structure = structural.patch_mask # patch_mask is true everywhere where there is structural 
     hole_pixels = np.logical_not(structure)
 
@@ -261,7 +260,7 @@ def detect_structural_rooms(structural: Fragment):
             continue
 
         # _, rect_fraction = is_fragment_rectangular(fragment, report_fraction=True)
-        if not hasattr(fragment, 'patch_mask'): fragment.compute(patch_mask=True)
+        fragment.compute(patch_mask=True)
 
         # cut 10% of pixels from each side before rectangular check (to cut away some potential bumps)
         dw = int(fragment.bounds.width * 0.1)
@@ -278,7 +277,6 @@ def detect_structural_rooms(structural: Fragment):
 
     return rooms
 
-@print_durations()
 def detect_dialogue_buttons(pixels, screen_size):
     create_debug_frame()
     fragments_mask = match_color_fuzzy(pixels, primary_dialogue_button_color, dialogue_button_color_max_deviation)
@@ -442,7 +440,6 @@ def debug_detect_corpse_loot(grab_screen_func=None, frames=None, mock_mode=False
 # if need optimizations:
 #    with generic loot it is probably safe to ignore topmost 10% of the room (and bottom 5% ????)
 #    with corpses it is probably safe to ignore about 1/3 of the top of the room
-@print_durations()
 def detect_loot(scan_bounds, grab_screen_func=None, frames=None):
     "provide either screen grab function or list of 2 frames"
     if frames is None:

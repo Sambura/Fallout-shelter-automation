@@ -97,6 +97,7 @@ class LootTestCase(TestCase):
                     break
             
             score = inner_hole.point_count / inner_hole.bounds.area
+            inner_hole.compute(points=True)
             inner_hole.points += base_fragment.bounds.low_pos[::-1]
 
             base_fragment.unite_with(inner_hole)
