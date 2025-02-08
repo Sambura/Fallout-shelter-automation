@@ -1,3 +1,6 @@
+# Not game specific functions and classes used for computer vision
+# Screen capture is also here
+
 from .debug import result_log
 
 from PIL import ImageGrab, Image
@@ -35,15 +38,14 @@ def reset_mock_frame_index():
     _mock_index = 0
 
 # frames / fixed mode
-def set_mock_frames(frames, mode='frames'):
-    global _mock_frames, _mock_mode
+def set_mock_frames(frames):
+    global _mock_frames
     _mock_frames = frames
-    _mock_mode = mode
     reset_mock_frame_index()
 
 def get_mock_frames(): return _mock_frames 
 
-def load_mock_frames(path, mode='frames'):
+def load_mock_frames(path):
     frames = []
 
     # filenames should have format (\d+)-.*?\.(png|jpg)
@@ -57,12 +59,12 @@ def load_mock_frames(path, mode='frames'):
             frames.append(img_array[:,:,:3])
     
     print(f'Loaded {len(frames)} mock frames')
-    set_mock_frames(frames, mode)
+    set_mock_frames(frames)
 
 def _is_frame_dir(path):
     return len([x for x in os.listdir(path) if x.endswith(('.jpg', '.png'))]) > 0
 
-def set_mock_frames_path(path, load_frames=True, load_mode='frames'):
+def set_mock_frames_path(path, load_frames=True):
     global _mock_directory, _mock_frame_paths, _current_mock_path_index
     has_images = _is_frame_dir(path)
     if has_images:
@@ -77,12 +79,12 @@ def set_mock_frames_path(path, load_frames=True, load_mode='frames'):
         raise Exception(f'Could not find mock frame directories in {path}')
 
     if load_frames:
-        load_mock_frames(_mock_frame_paths[_current_mock_path_index], load_mode)
+        load_mock_frames(_mock_frame_paths[_current_mock_path_index])
 
 def load_next_mock_path(previous=False):
     global _current_mock_path_index
     _current_mock_path_index = (_current_mock_path_index + (-1 if previous else 1)) % len(_mock_frame_paths)
-    load_mock_frames(_mock_frame_paths[_current_mock_path_index], _mock_mode)
+    load_mock_frames(_mock_frame_paths[_current_mock_path_index])
     return _mock_frame_paths[_current_mock_path_index]
 
 def get_current_mock_path():
@@ -102,20 +104,20 @@ def grab_mock_screen(bbox=None):
     if _mock_mode != 'fixed': _mock_index += 1
     return crop_image(_mock_frames[index].copy(), bbox)
 
-def init_screen_capture(mode='real', window_title=None, mock_directory=None, _mock_mode='frames', use_native=True):
+def init_screen_capture(mode='real', window_title=None, mock_directory=None, mock_mode='frames', use_native=True):
     """Performs necessary initializations for screen/window capture.
 
     Parameters:
         mode (str): either 'real' for capturing actual screen or 'mock' for mocking screen capture
         window_title (str): should be specified if 'real' mode is selected - window title to be captured
         mock_directory (str): may be specified if 'mock' mode is selected - path to directory with mock frames
-        _mock_mode (str): 'frames' for mock screen capture to return all found frames sequentially, or 'fixed' to return the first frame every time
+        mock_mode (str): 'frames' for mock screen capture to return all found frames sequentially, or 'fixed' to return the first frame every time
         use_native (bool): set to False to use generic capture function even if native is available (only for mode == 'real')
     
     Returns: a tuple (func, bool) with a function to be used for screen capture (with optional bbox parameter); and bool indicating whether 
         capture function has native implementation (True) or generic (False) 
     """
-    global __capture_func, __finish_func
+    global __capture_func, __finish_func, _mock_mode
     native_capture = False
 
     if mode == 'real':
@@ -140,7 +142,8 @@ def init_screen_capture(mode='real', window_title=None, mock_directory=None, _mo
         native_capture = False
 
         if mock_directory is not None:
-            set_mock_frames_path(mock_directory, load_mode=_mock_mode)
+            _mock_mode = mock_mode
+            set_mock_frames_path(mock_directory)
     else:
         raise Exception('mode should be `real` or `mock`')
 
@@ -218,6 +221,15 @@ class Bounds:
             if self.y_max == bounds.y_max or self.y_min == bounds.y_min: return False
         return True
 
+    def touches_contained_bounds(self, bounds, return_directions=False):
+        "Directions returned assume y goes from top to bottom, i.e. 0 is above 10"
+        directions = []
+        if self.x_min == bounds.x_min: directions.append('left')
+        if self.x_max == bounds.x_max: directions.append('right')
+        if self.y_min == bounds.y_min: directions.append('up')
+        if self.y_max == bounds.y_max: directions.append('down')
+        return directions if return_directions else len(directions) > 0
+
     def contains_point(self, x, y):
         return self.contains_bounds(Bounds(x, y, x, y))
 
@@ -235,13 +247,42 @@ class Bounds:
         x, y = offset
         return Bounds(self.x_min + x, self.y_min + y, self.x_max + x, self.y_max + y)
 
+    def intersect(self, bounds):
+        "Intersection of two bounds, which can be contained in either of them. Can have negative dimensions if intersection doesn't exist"
+        return Bounds(max(self.x_min, bounds.x_min), max(self.y_min, bounds.y_min), min(self.x_max, bounds.x_max), min(self.y_max, bounds.y_max))
+
+    def collapse_negative(self):
+        "Collapses negative width and/or height to 0. If bounds are normal, does nothing"
+        x_min, x_max = self.x_min, self.x_max
+        y_min, y_max = self.y_min, self.y_max
+
+        if x_min > x_max: x_min = x_max = (x_min + x_max) // 2
+        if y_min > y_max: y_min = y_max = (y_min + y_max) // 2
+
+        return Bounds(x_min, y_min, x_max, y_max)
+
+    def contain_all(self, *args):
+        "Makes bounds that contain all listed bounds"
+        # probably not the most efficient way, so what?
+        points = []
+        for bounds in args:
+            if bounds is None: continue 
+            points += bounds.get_corners()
+        
+        return Bounds.from_points(points)
+
+    def copy(self): return self.offset((0, 0))
+
     def offset_bounds(self, *offsets):
         "Expand/contract bounds by the specified offsets with respect to center"
         if len(offsets) == 1:
             v = offsets[0]
             return Bounds(self.x_min - v, self.y_min - v, self.x_max + v, self.y_max + v)
+        elif len(offsets) == 2:
+            w, h = offsets
+            return Bounds(self.x_min - w, self.y_min - h, self.x_max + w, self.y_max + h)
 
-        raise NotImplementedError('only implemented for 1 parameter for now :(')
+        raise NotImplementedError('only implemented for 1 or 2 parameters for now :(')
 
     def get_iou(self, bounds):
         "intersection over union of two bounds"
@@ -263,10 +304,24 @@ class Bounds:
 
         return intersection_area / union_area if union_area != 0 else 0
 
+    def __eq__(self, other):
+        if isinstance(other, Bounds):
+            return np.all(self.low_pos == other.low_pos) and np.all(self.shape == other.shape)
+        return NotImplemented
+
     def __str__(self):
         return f'(Bounds) x: {self.x} y: {self.y}; {self.width}x{self.height}'
 
 class Fragment:
+    """Fragment is a possibly non-contiguous chunk of pixels with "highly specific shape".
+
+    Attributes:
+        points: np.ndarray - array of pixel coordinates belonging to this fragment. Relative to fragment's bounds. Is not computed on init
+        point_count: int - number of pixels belonging to this fragment. Is not computed on init
+        source_patch: np.ndarray - the smallest image containing the entirety of this fragment. Is not computed on init
+        patch_mask: np.ndarray - a mask that matches all the pixels belonging to this fragment. Is not computed on init
+        masked_patch: np.ndarray - same as source_patch, but pixels not belonging to this fragment are zeroed out. Is not computed on init
+    """
     # apparently a lot of derivative attributes are pretty expensive to compute, hence we do not
     def __init__(self, source_pixels, mask, value, rect):
         self.fragment_value = value
@@ -280,10 +335,14 @@ class Fragment:
         self.patch_mask = None
         self.masked_patch = None
 
+    def simplify_source_mask(self):
+        self.source_mask = self.source_mask == self.fragment_value
+        self.fragment_value = True
+
     def compute(self, source_patch=False, patch_mask=False, masked_patch=False, points=False, point_count=False):
         if masked_patch: source_patch = patch_mask = True
-        if patch_mask: points = True
-        if points: point_count = True
+        if points: point_count = patch_mask = True
+        if point_count: patch_mask = True
 
         if source_patch and self.source_patch is not None: source_patch = False
         if patch_mask and self.patch_mask is not None: patch_mask = False
@@ -291,35 +350,38 @@ class Fragment:
         if points and self.points is not None: points = False
         if point_count and self.point_count is not None: point_count = False
         
+        if patch_mask:
+            self.patch_mask = (self.source_mask == self.fragment_value)[self.bounds.to_slice()]
+
         if points:
-            self.points = np.array(np.nonzero(self.source_mask == self.fragment_value)).T
+            self.points = np.array(np.nonzero(self.patch_mask)).T
 
         if point_count:
-            self.point_count = np.sum(self.source_mask == self.fragment_value) if self.points is None else len(self.points)
+            self.point_count = np.sum(self.patch_mask) if self.points is None else len(self.points)
 
         if source_patch:
             self.source_patch = self.source_pixels[self.bounds.to_slice()]
-        
-        if patch_mask:
-            self.patch_mask = np.zeros((self.bounds.height, self.bounds.width), dtype=bool)
-            self.patch_mask[self.points[:,0] - self.bounds.y_min, self.points[:,1] - self.bounds.x_min] = True
 
         if masked_patch:
             if len(self.source_patch.shape) == 2:
                 self.masked_patch = self.source_patch * self.patch_mask
             else:
                 self.masked_patch = self.source_patch * self.patch_mask[:,:,np.newaxis]
-
-    def unite_with(self, fragment):
+    
+    def unite_with(self, fragment, offset=(0, 0)):
         "Updates masked points and bounds. May break things since source_pixels may be too small after union"
         self.compute(points=True)
         fragment.compute(points=True)
-        self.point_count = None
-        self.points = np.unique(np.concatenate((self.points, fragment.points)), axis=0)
+        self.points = np.unique(np.concatenate((self.points + self.bounds.low_pos[::-1], fragment.points + fragment.bounds.low_pos[::-1] + offset[::-1])), axis=0)
         self.point_count = len(self.points)
         self.bounds = Bounds.from_points(*self.points[:, ::-1])
-        self.compute(point_count=True)
         self.masked_patch = self.source_patch = self.patch_mask = None
+        self.source_mask = np.zeros((self.points[:,0].max() + 1, self.points[:,1].max() + 1), dtype=self.source_mask.dtype)
+        self.source_mask[self.points[:,0], self.points[:,1]] = self.fragment_value
+        self.points -= self.bounds.low_pos[::-1]
+
+    def copy(self):
+        return Fragment(self.source_pixels, self.source_mask, self.fragment_value, self.bounds.to_rect())
 
 def detect_fragment(pixels, x, y, mask, value, matching_mask):
     _, _, _, rect = cv2.floodFill(mask, matching_mask, (x, y), value, 255, 255, cv2.FLOODFILL_FIXED_RANGE)
@@ -330,9 +392,9 @@ def fragment_mask_prepare(mask):
     return np.pad(np.logical_not(mask), 1, 'constant', constant_values=True).astype(np.uint8)
 
 def detect_fragments(pixels, fragments_mask, **compute_kwargs) -> tuple[list[Fragment], np.ndarray, np.ndarray, np.ndarray]:
-    "returns list of found fragments, list of x and list of y coordinates derived from fragment_mask, and the numeric mask (fragments, xs, ys, mask)"
+    "Returns (fragments, xs, ys, mask): a list of found fragments, list of x and list of y coordinates derived from fragment_mask, and the numeric mask"
     mask = np.zeros(pixels.shape[:2], dtype=int)
-    ys, xs = np.where(fragments_mask)
+    ys, xs = np.nonzero(fragments_mask)
     fragments_mask = fragment_mask_prepare(fragments_mask)
 
     fragment_index = 1
@@ -412,7 +474,7 @@ def _match_color_hue(pixels, target_hue, min_pixel_value=0, tolerance=0):
     pixel_values = np.sum(pixels, axis=2)
     mask = pixel_values >= min_pixel_value
     hues = cv2.cvtColor(pixels, cv2.COLOR_RGB2HSV)[:,:,0]
-    return (np.abs(hues - target_hue) <= tolerance) & mask
+    return (np.abs(hues.astype(int) - target_hue) <= tolerance) & mask
 
 def match_color_hue(pixels, color, min_pixel_value=0, tolerance=0):
     target_hue = cv2.cvtColor(color.reshape(1, 1, -1), cv2.COLOR_RGB2HSV)[:,:,0]
@@ -473,7 +535,7 @@ def _is_fragment_rectangular(patch_mask):
     rect_mask = np.ones(patch_mask.shape, dtype=bool)
     rect_mask[1:-1, 1:-1] = False
 
-    # same as np.sum(rect_mask)
+    # next 4 lines are the same as np.sum(rect_mask) (but presumably faster)
     if rect_mask.shape[0] == 1 or rect_mask.shape[1] == 1:
         mask_ones_count = rect_mask.shape[0] + rect_mask.shape[1] - 1
     else:

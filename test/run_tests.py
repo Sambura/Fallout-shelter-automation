@@ -1,3 +1,12 @@
+import sys
+sys.path.append("..")
+
+try:
+    from src.vision import Bounds # we don't actually need bounds, this is just test import
+except ImportError:
+    print('Aborting: Failed to import main module. Make sure you run this script from `test` directory')
+    quit()
+
 from test_src.loot_collection import *
 from test_src.test_case import TestCase
 

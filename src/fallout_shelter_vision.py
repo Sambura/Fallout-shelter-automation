@@ -1,4 +1,4 @@
-# Function specific to the game
+# Functions specific to the game
 # Most of the functions are used to detect certain in-game objects / ui elements
 
 from .debug import *
@@ -21,6 +21,10 @@ def get_room_type(room, loc):
     if loc != 'full': return 'unknown'
     return 'elevator'
 
+# room w/h ratios:
+# elevator: ~0.52, small room: ~1.59, medium room: ~3.34, large room: ~5.1, wall: ~0.178
+# elevator: ~0.52, small room: ~1.77, medium room: ~3.52, large room: ~5.28, wall: ~0.178
+# ~0.70
 # (room_type, location, bounds)
 def detect_rooms(pixels, return_fragments=False):
     create_debug_frame()
@@ -181,8 +185,10 @@ def detect_structural(pixels):
     create_debug_frame()
     fragments_mask = match_color_exact(pixels, structural_color)
     fragments, _, _, mask = detect_fragments(pixels, fragments_mask)
+    progress_log(f'{len(fragments)} potential structural fragments')
 
     for fragment in fragments[:]: # copy list
+        progress_log(f'Structural fragment: {fragment.bounds}')
         if fragment.bounds.are_smaller_than(structural_min_size, both_axes=True): 
             fragments.remove(fragment)
             continue
@@ -190,6 +196,7 @@ def detect_structural(pixels):
         fragment.compute(point_count=True)
         if fragment.point_count < structural_min_pixels: 
             fragments.remove(fragment)
+            progress_log(f'Removed structural fragment: {fragment.point_count}')
             continue
         
         # progress_log(f'Detected structural fragment: {fragment.point_count} pixel count')
@@ -243,21 +250,24 @@ def detect_structural_rooms(structural: Fragment):
     structure = structural.patch_mask # patch_mask is true everywhere where there is structural 
     hole_pixels = np.logical_not(structure)
 
-    fragments, _, _, _ = detect_fragments(structure, hole_pixels)
+    fragments, _, _, mask = detect_fragments(structure, hole_pixels)
     rooms = []
 
     for fragment in fragments:
         if fragment.bounds.area < struct_min_room_pixels: continue
         # these just remove some of the edge cases to reduce number of false positive room detections
-        if fragment.bounds.x_min == 0 and structural.bounds.x_min != 0: continue
-        if fragment.bounds.y_min == 0 and structural.bounds.y_min != 0: continue
-        if fragment.bounds.x_max == structural.bounds.width - 1 and structural.bounds.x_max != screen_shape[1] - 1: continue
-        if fragment.bounds.y_max == structural.bounds.height - 1 and structural.bounds.y_max != screen_shape[0] - 1: continue
+        # if fragment.bounds.x_min == 0 and structural.bounds.x_min != 0: continue
+        # if fragment.bounds.y_min == 0 and structural.bounds.y_min != 0: continue
+        # if fragment.bounds.x_max == structural.bounds.width - 1 and structural.bounds.x_max != screen_shape[1] - 1: continue
+        # if fragment.bounds.y_max == structural.bounds.height - 1 and structural.bounds.y_max != screen_shape[0] - 1: continue
 
         clearance_fraction = np.sum(hole_pixels[fragment.bounds.to_slice()]) / fragment.bounds.area
         if clearance_fraction < struct_min_room_clearance_fraction: 
             progress_log(f'Filtered out structural room: {clearance_fraction} clearance')
             continue
+
+        if visual_debug_level >= VISUAL_DEBUG_PROGRESS:
+            get_do()[structural.bounds.to_slice()][mask == fragment.fragment_value] += get_debug_color(fragment.fragment_value)
 
         # _, rect_fraction = is_fragment_rectangular(fragment, report_fraction=True)
         fragment.compute(patch_mask=True)
@@ -272,7 +282,7 @@ def detect_structural_rooms(structural: Fragment):
         rooms.append(fragment.bounds.offset(structural.bounds.low_pos))
         
         # progress_log(f'Detected structural room ({fragment.bounds}) : border fraction {rect_fraction*100:0.2f}%, clearance: {clearance_fraction*100:0.2f}%')
-        if visual_debug_level >= VISUAL_DEBUG_PROGRESS:
+        if visual_debug_level >= VISUAL_DEBUG_RESULT:
             draw_border(get_do(), rooms[-1], get_debug_color(fragment.fragment_value), thickness=2)
 
     return rooms

@@ -4,17 +4,25 @@ from .util import rotate_vector_2d
 
 import numpy as np
 
-def draw_border(pixels: np.ndarray, bounds: Bounds, color: np.ndarray, thickness=1):
+def draw_border(pixels: np.ndarray, bounds: Bounds, color: np.ndarray, thickness=1, replace=False):
     "Make sure pixels have the same or larger data type than color"
     border = np.ones((*bounds.shape, pixels.shape[2]), dtype=pixels.dtype) * color
     h_thickness = min(thickness, (bounds.width - thickness) // 2)
     v_thickness = min(thickness, (bounds.height - thickness) // 2)
     border[v_thickness:-v_thickness, h_thickness:-h_thickness] = 0
+    
+    border_bounds = bounds.intersect(Bounds(0, 0, pixels.shape[1] - 1, pixels.shape[0] - 1)).offset(-bounds.low_pos).collapse_negative()
 
-    try:
-        pixels[bounds.to_slice()] += border
-    except:
-        progress_log('draw border failed')
+    if replace:
+        pixels[bounds.to_slice()] = border[border_bounds.to_slice()]
+    else:
+        pixels[bounds.to_slice()] += border[border_bounds.to_slice()]
+
+def draw_rect(pixels, bounds, color, replace=False):
+    if replace:
+        pixels[bounds.to_slice()] = color
+    else:
+        pixels[bounds.to_slice()] += color
 
 def draw_circle(canvas, pos, radius, color, thickness=1):
     x, y = pos

@@ -147,7 +147,8 @@ class PixelMatcherApp:
             MatchFunctionEntry(match_color_grades_std, "Match tone std", [('color', 'color_picker', None), ('min_pixel_value', 'int_slider', (0, 765)), ('tolerance', 'float_slider', (0, 100))]),
             MatchFunctionEntry(match_color_hue, "Match hue", [('color', 'color_picker', None), ('min_pixel_value', 'int_slider', (0, 765)), ('tolerance', 'int_slider', (0, 180))]),
             MatchFunctionEntry(_match_color_hue, "Match hue direct", [('hue', 'int_slider', (0, 180)), ('min_pixel_value', 'int_slider', (0, 765)), ('tolerance', 'int_slider', (0, 180))]),
-            MatchFunctionEntry(match_by_rgb_ltr_ratio, "RGB-RTL-R", [('g2r', 'float_slider', (0, 3)), ('b2g', 'float_slider', (0, 3))])
+            MatchFunctionEntry(match_by_rgb_ltr_ratio, "RGB-RTL-R", [('g2r', 'float_slider', (0, 3)), ('b2g', 'float_slider', (0, 3))]),
+            MatchFunctionEntry(match_blending_pixels, "Blending", [('primary', 'color_picker', None), ('secondary', 'color_picker', None), ('blending', 'float_slider', (0, 1)), ('tolerance', 'int_slider', (0, 255))])
         ]
 
         self.collapse_button = ttk.Button(self.interactive_frame, text="Collapse panel", command=self.toggle_interactive_frame)

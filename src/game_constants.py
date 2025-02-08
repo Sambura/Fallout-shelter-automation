@@ -86,3 +86,6 @@ objective_panel_min_pixels = 200000
 double_click_activation_radius = 38 # presumably is floor(screen_width / 50)
 safe_mouse_click_delay = 0.35 # seconds between clicks to not trigger double click
 mouse_click_duration = 0.12 # how long should a mouse button be held during a click
+
+# min walls thickness = 16
+camera_post_pan_duration = 0.06 # sometimes when key is released, camera would still pan for some time

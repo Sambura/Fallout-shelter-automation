@@ -12,6 +12,14 @@ def are_opposite_directions(direction: str, other_direction: str) -> bool:
 def is_vertical(direction: str) -> bool: return direction in V_DIRECTIONS
 def is_horizontal(direction: str) -> bool: return direction in H_DIRECTIONS
 
+def opposite_direction(direction: str) -> str:
+    direction = set([direction])
+    directions = set(H_DIRECTIONS) - direction
+    if len(directions) == 2:
+        directions = set(V_DIRECTIONS) - direction
+
+    return list(directions)[0]
+
 def slow_loop(interval, max_iter_count=None, max_duration=None):
     "for x in slow_loop(...); interval in seconds. Infinite iterations by default"
     if max_iter_count is None: max_iter_count = float('inf')

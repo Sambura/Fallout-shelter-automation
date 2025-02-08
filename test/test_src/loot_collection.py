@@ -1,10 +1,8 @@
-import sys
-sys.path.append("..")
-
-from .test_case import TestCase
 from src.vision import *
 from src.vision import _is_fragment_rectangular
 from src.fallout_shelter_vision import detect_generic_loot, compute_loot_masks, detect_corpse_loot
+
+from .test_case import TestCase
 
 import re
 import os
@@ -76,7 +74,7 @@ class LootTestCase(TestCase):
             base_fragment = fragments[0]
             base_fragment.compute(masked_patch=True)
             fragments.remove(base_fragment)
-            holes = detect_fragments(base_fragment.masked_patch, base_fragment.masked_patch == 0, patch_mask=True)[0]
+            holes = detect_fragments(base_fragment.masked_patch, base_fragment.masked_patch == 0, patch_mask=True, points=True)[0]
             inner_hole = None
             for hole in holes:
                 hole.bounds = hole.bounds.offset(base_fragment.bounds.low_pos)
@@ -97,8 +95,6 @@ class LootTestCase(TestCase):
                     break
             
             score = inner_hole.point_count / inner_hole.bounds.area
-            inner_hole.compute(points=True)
-            inner_hole.points += base_fragment.bounds.low_pos[::-1]
 
             base_fragment.unite_with(inner_hole)
             base_fragment.compute(patch_mask=True)
@@ -130,7 +126,7 @@ class LootTestCase(TestCase):
                 if not np.any(crop & fragment.patch_mask):
                     self.failure_reason += f'Failed to detect one or more {label} loots. '
                     return False
-                mask[fragment.points[:, 0], fragment.points[:, 1]] = True
+                mask[fragment.points[:, 0] + fragment.bounds.y_min, fragment.points[:, 1] + fragment.bounds.x_min] = True
             
             if np.any(results & mask != results):
                 self.failure_reason += f'False positive on {label} loot. '

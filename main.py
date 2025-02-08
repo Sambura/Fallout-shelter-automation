@@ -52,6 +52,7 @@ def visualize_fragment_grouping(fragments_mask, radius=40):
 
 # down and up are switched for stupid reasons (down means smaller coordinate, screen top is 0)
 CAMERA_PAN_KEYS = { 'left': 'a', 'right': 'd', 'down': 'w', 'up': 's' }
+DIRECTION_MAP_XY = { 'left': np.array([-1, 0]), 'right': np.array([1, 0]), 'down': np.array([0, -1]), 'up': np.array([0, 1]) }
 
 def same_rooms(rooms1, rooms2):
     if rooms1 is None and rooms2 is None: return True
@@ -98,6 +99,16 @@ def match_room_with_structural(structural_rooms, room_bounds):
 
     return False
 
+def get_panning_bounds(bounds, direction, container_bounds):
+    if direction == 'left':
+        return Bounds(bounds.x_min, bounds.y_min, container_bounds.x_max, bounds.y_max)
+    elif direction == 'right':
+        return Bounds(container_bounds.x_min, bounds.y_min, bounds.x_max, bounds.y_max)
+    elif direction == 'up':
+        return Bounds(bounds.x_min, container_bounds.y_min, bounds.x_max, bounds.y_max)
+    elif direction == 'down':
+        return Bounds(bounds.x_min, bounds.y_min, bounds.x_max, container_bounds.y_max)
+
 # TODO's list:
 # 
 # would be cool:
@@ -108,6 +119,7 @@ def match_room_with_structural(structural_rooms, room_bounds):
 #   - [might not be needed] modify loot detection: if a loot is consistently detected at a location but is failed to be collected, increase number of attempts, assuming loot detection is correct
 #
 #   - add a new chord starter for debug functions (?????)
+#   - add auto capture check that verifies that native capture returns image that is not fully zeroed out
 #
 #  big things:
 #   - detect both enemy and ally health/rad levels. detect enemy boss icon
@@ -119,9 +131,604 @@ def match_room_with_structural(structural_rooms, room_bounds):
 #        - fun fact, you can also know the mission is complete by looking at topright button - there will be an exclamation mark if mission is complete
 #   - note: `objective complete` popups are not clickable, no need to look for them i think
 #
-#   - after a dialogue choice is made, make sure to click the screen a couple of times (this should be happening, need to double check in-game)
-#  (if the dialogue is still on, to skip the finishing lines)
+#   - fix the thing where program doesn't close if game is closed (windows native capture) 
 #   
+
+class GameRoom:
+    def __init__(self, level, detection_type, bounds, limits, y, room_height):
+        self.visited = False # this is set elsewhere
+        self.discovered = detection_type == 'unvisited'
+        self.level = level
+        self.bounds = bounds
+        self.unknown_directions = limits
+        self.full_bounds = limits == []
+        self.room_type = get_room_type(bounds, 'full' if self.full_bounds else '')
+        self.level_y = int(y)
+        self.room_target_height = room_height
+        self.pos = None
+        self.estimate_width()
+        self.align_bounds()
+
+    def estimate_width(self):
+        ratio = self.bounds.width / self.bounds.height + 0.17
+        self.width = round(3 * ratio / 1.75)
+    
+    def align_bounds(self):
+        x0, x1 = self.bounds.x_min, self.bounds.x_max
+        hrw = self.room_target_height // 2
+        self.bounds = Bounds(x0, self.level_y - hrw, x1, self.level_y + hrw)
+        self.pivot = (self.bounds.x_min + int(self.bounds.width / self.width / 2), self.bounds.y)
+        self.pivots = [(self.pivot[0] + x * int(self.bounds.width / self.width), self.pivot[1]) for x in range(self.width)]
+
+    def merge(self, other):
+        low_iou = self.bounds.get_iou(other.bounds) < 0.1
+        progress_log(f'Merging: IoU: {self.bounds.get_iou(other.bounds)}')
+        if low_iou:
+            progress_log(f'Warning: merging rooms with low IoU')
+        
+        self.discovered |= other.discovered
+
+        if self.full_bounds: 
+            return not low_iou
+
+        self.bounds = Bounds.from_points(*self.bounds.get_corners(), *other.bounds.get_corners())
+        self.align_bounds()
+        self.unknown_directions = list(set(self.unknown_directions) & set(other.unknown_directions))
+
+        self.full_bounds = self.unknown_directions == []
+        self.room_type = get_room_type(bounds, 'full' if self.full_bounds else '')
+        return True
+
+class GameMap:
+    def __init__(self, grid_map, rooms, room_height):
+        self.room_grid = grid_map
+        # sort rooms top -> bottom; left -> right (top-left -> bottom-right)
+        self.rooms = sorted(rooms, key=lambda x: -x.level)
+        self.rooms = sorted(self.rooms, key=lambda x: x.bounds.x)
+        x_lists = [list(x.keys()) for x in grid_map.values()]
+        self.grid_size = (len(grid_map), 1 + np.max([np.max(x) for x in x_lists]) - np.min([np.min(x) for x in x_lists]))
+        self.room_count = len(rooms)
+        self.room_height = round(room_height)
+
+    def render_mini_map(self, scale=3):
+        cell_width = 3 * scale
+        cell_height = 6 * scale
+        gap_size = 1 * scale
+        border_thickness = round(0.51 * scale)
+        padding = 2 * scale
+
+        bg_color = np.array([57, 57, 57])
+        starter_color = np.array([43, 204, 228])
+        visited_color = np.array([162, 162, 162])
+        structural_color = np.array([0, 0, 0])
+        elevator_color = np.array([226, 204, 57])
+        unvisited_color = np.array([67, 217, 42])
+        error_color = np.array([255, 0, 255])
+
+        canvas = np.full((*(np.array(self.grid_size) * (cell_height + gap_size, cell_width + gap_size) + padding * 2), 3), bg_color)
+
+        coords = np.array([x.pos for x in self.rooms])
+        x_min, y_min = np.min(coords, axis=0)
+
+        for room in self.rooms:
+            cell_pos = np.array([room.pos[0] - x_min, self.grid_size[0] - room.pos[1] + y_min - 1])
+            pixel_pos = cell_pos * (cell_width + gap_size, cell_height + gap_size) + padding - gap_size
+            width = (cell_width + gap_size) * room.width - gap_size
+            height = cell_height
+            color = error_color
+            border = False
+
+            if (not room.discovered or room.visited) and room.room_type == 'elevator':
+                color = elevator_color
+            elif room.visited and room.discovered:
+                color = visited_color
+            elif not room.visited and not room.discovered:
+                color = starter_color
+            elif room.discovered:
+                color = unvisited_color
+                border = True
+
+            bounds = Bounds(pixel_pos[0], pixel_pos[1], pixel_pos[0] + width, pixel_pos[1] + height)
+            if border:
+                draw_border(canvas, bounds, color, thickness=border_thickness, replace=True)
+            else:
+                draw_rect(canvas, bounds, color, replace=True)
+
+        return canvas
+
+class GameMapComposer:
+    def __init__(self, screen_bounds):
+        self.raw_unvisited_rooms = [] # basically rooms detected with detect_rooms
+        self.raw_visited_rooms = []   # rooms detected with structural detection
+        self.screen_bounds = screen_bounds
+        self.structural = None  # ? need
+        self.map_bounds = None # bounds in absolute coords which contain all discovered objects
+
+    def _had_same_room(self, raw_room_list, bounds):
+        "check if similar room was already added to the list"
+        min_iou = 0.9 # others will deal with actually visible deviations 
+        for room_bounds, _ in raw_room_list:
+            # progress_log(f'   -> IoU: {room_bounds.get_iou(bounds)}')
+            if room_bounds.get_iou(bounds) >= min_iou:
+                # progress_log(f'Warning: same room was already added: {bounds}')
+                return True
+        
+        return False
+
+    def _process_room_location(self, camera_pos, bounds):
+        actual_bounds = bounds.offset(camera_pos)
+        limited_directions = self.screen_bounds.touches_contained_bounds(bounds, return_directions=True)
+        return (actual_bounds, limited_directions)
+
+    def _update_map_bounds(self, new_bounds):
+        self.map_bounds = Bounds.contain_all(self.map_bounds, new_bounds)
+
+    def _add_unvisited_room(self, room_info: (Bounds, list[str]), room_list=None):
+        if room_list is None:
+            progress_log(f'Adding new unvisited room: {room_info[0]}')
+            room_list = self.raw_unvisited_rooms
+            self._update_map_bounds(room_info[0])
+        
+        if self._had_same_room(room_list, room_info[0]): return
+        room_list.append(room_info)
+
+    def _add_visited_room(self, room_info: (Bounds, list[str]), room_list=None):
+        if room_list is None:
+            progress_log(f'Adding new visited room: {room_info[0]}')
+            room_list = self.raw_visited_rooms
+            self._update_map_bounds(room_info[0])
+
+        if self._had_same_room(room_list, room_info[0]): return
+        room_list.append(room_info)
+
+    def update_structural_map(self, structural, camera_pos):
+        if self.structural is None:
+            self.structural = structural.copy()
+            self.structural.bounds = structural.bounds.offset(camera_pos)
+            self.structural.simplify_source_mask()
+            return
+        
+        self.structural.unite_with(structural, offset=camera_pos)
+
+    def _process_raw_inputs(self, camera_pos, rooms, structural_rooms, vl=None, ul=None):
+        if rooms is None: rooms = []
+        if structural_rooms is None: structural_rooms = []
+
+        for room_type, location, bounds in rooms:
+            self._add_unvisited_room(self._process_room_location(camera_pos, bounds), room_list=ul)
+
+        for bounds in structural_rooms:
+            self._add_visited_room(self._process_room_location(camera_pos, bounds), room_list=vl)
+
+    def add_rooms(self, structural, camera_pos=None, rooms=None, structural_rooms=None):
+        "Add rooms detected at given camera x,y position to the map"
+
+        if camera_pos is None: camera_pos = self.last_camera_pos
+        self.update_structural_map(structural, camera_pos)
+        self._process_raw_inputs(camera_pos, rooms, structural_rooms)
+
+    def compose(self, camera_pos=None, rooms=None, structural_rooms=None):
+        ###
+        ### Step 0: select room lists
+        raw_unvisited_rooms = []
+        raw_visited_rooms = []
+        if rooms is not None:
+            if camera_pos is None: camera_pos = self.last_camera_pos
+            self._process_raw_inputs(camera_pos, rooms, structural_rooms, raw_visited_rooms, raw_unvisited_rooms)
+        else:
+            raw_unvisited_rooms = self.raw_unvisited_rooms
+            raw_visited_rooms = self.raw_visited_rooms
+
+        ###
+        ### Step 1: compute room height and find room to use as anchor
+        self.room_height = None
+        match_threshold = 0.12
+        unvisited_height_factor = 0.09 # unvisited rooms have larger bounds
+        max_level_gap = 1.5 # 150% of room height
+        found_full_height = True
+        anchor_room = None
+
+        def get_full_height_rooms(room_list):
+            return [room for room in room_list if [y for y in room[2] if is_vertical(y)] == []]
+        
+        def set_room_height(height):
+            nonlocal match_threshold
+            self.room_height = height
+            match_threshold *= self.room_height
+
+        def _match(x1, x2): return abs(x1 - x2) <= match_threshold
+
+        def find_anchor_room(room_list):
+            filtered_rooms = [len(limits) for t, bounds, limits in room_list if _match(bounds.height, self.room_height)]
+            if filtered_rooms == []: return None
+            return room_list[np.argmin(filtered_rooms)]
+
+        raw_room_list = [('unvisited', x[0].offset_bounds(-int(x[0].height * unvisited_height_factor / 2)), x[1]) for x in raw_unvisited_rooms] + [('visited', *x) for x in raw_visited_rooms]
+        progress_log(f'Compose: processing {len(raw_room_list)} rooms')
+        for room in raw_room_list:
+            progress_log(f'   > {room[0]} room at {room[1]}')
+
+        full_height_unvisited = get_full_height_rooms([room for room in raw_room_list if room[0] == 'unvisited'])
+        full_height_visited = get_full_height_rooms([room for room in raw_room_list if room[0] == 'visited'])
+
+        # unvisited rooms have more reliable bounds as of now, try that first
+        if full_height_unvisited != []:
+            set_room_height(np.median([x.height for _, x, _ in full_height_unvisited]))
+            anchor_room = find_anchor_room(full_height_unvisited)
+
+        if full_height_visited != []:
+            if self.room_height is None:
+                set_room_height(np.median([x.height for _, x, _ in full_height_visited]))
+            
+            # look for anchor room even if we already have one, maybe there's a better one!
+            anchor_room_candidate = find_anchor_room(full_height_visited)
+            if anchor_room is None or (anchor_room_candidate is not None and len(anchor_room_candidate[2]) < len(anchor_room[2])):
+                anchor_room = anchor_room_candidate
+
+        # if no full-height rooms found, make something up
+        if self.room_height is None:
+            # bias the height to be large
+            set_room_height(np.percentile([x.height for _, x, _ in raw_room_list], 75))
+            anchor_room = find_anchor_room(raw_room_list)
+            found_full_height = False
+
+        # discard too tall rooms
+        raw_room_list = [room for room in raw_room_list if room[1].height < self.room_height or _match(room[1].height, self.room_height)]
+        progress_log(f'Compose: {len(raw_room_list)} match for height')
+        
+        ###
+        ### Step 2: find and set vertical levels for rooms
+        levels = { 0: anchor_room[1].y }
+        level_rooms = { 0: [] }
+        levels_gap = None
+        # levels are done as in real life, e.g. the higher the level on the screen, the higher its number is
+
+        def on_level(bounds, y):
+            level_half_height = self.room_height / 2 + match_threshold
+            y0, y1 = y - level_half_height, y + level_half_height
+            return y0 <= bounds.y_min and bounds.y_max <= y1
+
+        def select_level(bounds):
+            diffs = [abs(bounds.y - y) for y in levels.values()]
+            closest_level = list(levels.keys())[np.argmin(diffs)]
+
+            if on_level(bounds, levels[closest_level]): return closest_level
+            
+            return None # no matching levels exist (yet)
+
+        def make_new_level(bounds):
+            nonlocal levels_gap
+            
+            y_delta = bounds.y - levels[0]
+            delta_direction = -1 if y_delta > 0 else 1
+            gap = abs(y_delta)
+            if levels_gap is None:
+                if not _match(bounds.height, self.room_height): return None
+                if gap / self.room_height > max_level_gap: return None
+                levels_gap = gap
+
+                new_level = delta_direction # higher y -> lower on screen -> lower level
+                levels[new_level] = bounds.y
+                return new_level
+
+            new_level = round(gap / levels_gap) * delta_direction
+            levels[new_level] = levels[0] - new_level * levels_gap * delta_direction
+            return new_level
+
+        # start placing rooms on their levels
+        unplaced_rooms = []
+        room_list = raw_room_list
+        for _ in range(2): # first iter: initial placement, second: placing unplaced ones
+            for room in room_list:
+                room_type, bounds, limits = room
+                level = select_level(bounds)
+                if level is not None:
+                    progress_log(f'Compose: placed room on level {level}')
+                    level_rooms[level].append(room)
+                    continue
+
+                new_level = make_new_level(bounds)
+                if new_level is not None:
+                    if not on_level(bounds, levels[new_level]):
+                        progress_log(f'Compose: discarded room [unknown level]')
+                        del levels[new_level] # discard room and new level
+                        continue
+                    
+                    progress_log(f'Compose: placed room on [new] level {new_level}')
+                    level_rooms[new_level] = [room]
+                    continue
+
+                unplaced_rooms.append(room)
+
+            # stabilize levels
+            for level in levels:
+                rooms = level_rooms[level]
+                rooms_normal_height = [room for room in rooms if _match(room[1].height, self.room_height)]
+                if rooms_normal_height != []:
+                    levels[level] = np.mean([room[1].y for room in rooms_normal_height])
+
+            progress_log(f'Compose l-{_}: unplaced rooms: {len(unplaced_rooms)}')
+            room_list = unplaced_rooms
+            if room_list == []: break
+
+            if levels_gap is None: # call it emergency heuristic 
+                levels_gap = int(self.room_height * 1.18)
+
+        ###
+        ### Step 3: match, merge and classify rooms
+        clean_level_rooms = { }
+        overlap_iou_threshold = 0.01
+        room_zero = None
+
+        for level, rooms in level_rooms.items():
+            clean_rooms = []
+            for room_type, bounds, limits in rooms:
+                room = GameRoom(level, room_type, bounds, limits, levels[level], self.room_height)
+
+                # check if room overlaps with any existing clean room
+                discard_room = False
+                for clean_room in clean_rooms:
+                    if room.bounds.get_iou(clean_room.bounds) >= overlap_iou_threshold:
+                        progress_log(f'Compose: rooms overlap, attempting merge')
+                        discard_room = clean_room.merge(room)
+                        break
+
+                if discard_room: continue
+                clean_rooms.append(room)
+                if room_zero is None and room.full_bounds or 'left' not in room.unknown_directions:
+                    room_zero = room
+
+            clean_level_rooms[level] = sorted(clean_rooms, key=lambda x: x.bounds.x)
+
+        ###
+        ### Step 4: put rooms on grid
+        if room_zero is None:
+            result_log('Critical: room zero was not set')
+            return
+
+        flat_room_list = [room for level in clean_level_rooms.values() for room in level]
+        progress_log(f'Compose: making a grid, {len(flat_room_list)} rooms total')
+        flat_room_list.remove(room_zero)
+        grid_map = {}
+        on_grid_rooms = []
+        grid_origin = room_zero.pivot
+
+        def put_on_grid(room, x, y):
+            nonlocal grid_map
+            progress_log(f'Compose: placing on grid {room.bounds}: {y}, {x}, width: {room.width}')
+            on_grid_rooms.append(room)
+            room.pos = (x, y)
+
+            for pivot in room.pivots:
+                draw_disk(get_do(), pivot, 8, np.array([255, 0, 0, 255]))
+
+            if y not in grid_map:
+                grid_map[y] = {c: room for c in range(x, x + room.width)}
+                return
+
+            for c in range(x, x + room.width):
+                if c in grid_map[y]: raise Exception('your bad')
+                grid_map[y][c] = room
+        
+        put_on_grid(room_zero, 0, 0)
+
+        use_proximity_placing = True
+        pivot_tolerance = int(self.room_height * 0.2)
+        cell_width = int(self.room_height * 1.75 / 3)
+        while len(flat_room_list) > 0:
+            unplaced_rooms = []
+
+            for room in flat_room_list:
+                cell_y = room.level - room_zero.level
+                best_match = np.argmin([abs(x.bounds.x - room.bounds.x) for x in on_grid_rooms])
+                anchor = on_grid_rooms[best_match]
+                progress_log(f'Selected anchor: {anchor.bounds} ({abs(anchor.bounds.x - room.bounds.x)})')
+                i1, j1 = None, None # closest match
+                closest = float('inf')
+                i0, j0 = None, None # direct match
+
+                for i, pivot in enumerate(room.pivots):
+                    for j, placed_pivot in enumerate(anchor.pivots):
+                        distance = abs(pivot[0] - placed_pivot[0])
+                        if distance < closest:
+                            i1, j1 = i, j
+                            closest = distance
+                        if distance < pivot_tolerance:
+                            i0, j0 = i, j
+                            break
+                
+                direct_match = j0 is not None
+                indirect_match = (closest - cell_width < pivot_tolerance) and not direct_match
+                no_match = not direct_match and not indirect_match
+                if no_match and use_proximity_placing:
+                    progress_log('Compose: Room not placed due to proximity setting')
+                    unplaced_rooms.append(room)
+                    continue
+                
+                i2, j2 = i0, j0
+                offset = 0
+                if indirect_match or no_match:
+                    i2, j2 = i1, j1
+                    delta = room.pivots[i2][0] - anchor.pivots[j2][0]
+                    delta_sign = 1 if delta > 0 else -1
+                    if indirect_match:
+                        offset = delta_sign
+                        progress_log('Compose: placing using indirect match')
+                    else:
+                        offset = delta_sign * round(abs(delta) / cell_width)
+                        progress_log('Compose: placing using extrapolation')
+                else:
+                    progress_log('Compose: placing using direct match')
+
+
+                cell_x = anchor.pos[0] + j2 - i2 + offset
+                put_on_grid(room, cell_x, cell_y)
+
+            use_proximity_placing = len(unplaced_rooms) != len(flat_room_list)
+            if not use_proximity_placing:
+                progress_log(f'Warning: proximity placement is off')
+            flat_room_list = unplaced_rooms
+
+        game_map = GameMap(grid_map, on_grid_rooms, self.room_height)
+        if rooms is not None:
+            self.current_map = game_map
+        
+        result_log(f'GameMap compose complete. Grid: {game_map.grid_size[0]} levels, width: {game_map.grid_size[1]} cells. Rooms: {game_map.room_count}')
+        return game_map
+
+    def get_current_discovery_direction(self):
+        "which way and how far should camera move to (at some point) see unseen rooms / fragments"
+        # primitive implementation, TODO improve
+        #  - need `pathfinding` - camera shouldn't lose track of rooms, so it is essential to choose direction in which camera will still be able
+        #       to track its location
+        #  - need to discover around rooms: probably based on structural (or camera pos history) determine where there may be rooms
+        #       that are really close to known ones but were not in camera's fov
+        c_pos = self.last_camera_pos
+        rooms = self.current_map.rooms
+        # nothing special about height, could've been a hardcoded number instead
+        min_camera_movement = self.current_map.room_height
+
+        for room in rooms:
+            if room.full_bounds: continue
+            # direction we must move in
+            delta_x = room.bounds.x - c_pos[0]
+            delta_y = room.bounds.y - c_pos[1]
+
+            if abs(delta_x) > min_camera_movement:
+                return 'left' if delta_x < 0 else 'right'
+            if abs(delta_y) > min_camera_movement:
+                return 'down' if delta_y < 0 else 'up'
+
+            return room.unknown_directions[0]
+
+        return None
+
+    def set_camera_position(self, camera_pos):
+        self.last_camera_pos = camera_pos
+    
+    def _room_match_exact(self, anchor_room_info, room_info, direction):
+        ### common setup
+        anchor_bounds = anchor_room_info[1]
+        bounds = room_info[1]
+        shared_limits = set(anchor_room_info[2]).intersect(room_info[2])
+        all_limits = set(anchor_room_info[2]).unite(room_info[2])
+        different_limits = all_limits - shared_limits
+        directions = ['left', 'down', 'right', 'up']
+
+        ### direction specific setup
+
+        v = is_vertical(direction)
+        primary_index = directions.index(direction)
+        secondary_index = directions.index(opposite_direction(direction))
+        min_index = 1 if v else 0
+        max_index = 3 if v else 2
+        illegal_limit_diff = is_horizontal if v else is_vertical
+        matching_indices = [0, 2] if v else [1, 3]
+
+        ### common match code
+        
+        for index in matching_indices:
+            if adjusted_bounds.to_rect()[index] != anchor_bounds.to_rect()[index]: return False, 0
+
+        # only limits along pan direction can change
+        for x in different_limits:
+            if illegal_limit_diff(x): return False, 0
+        
+        if direction not in shared_limits: # choose anchor side
+            camera_offset = anchor_bounds.to_rect()[primary_index] - bounds.to_rect()[primary_index]
+        else:
+            camera_offset = anchor_bounds.to_rect()[secondary_index] - bounds.to_rect()[secondary_index]
+
+        if camera_offset < 0: return False, 0 # that would mean camera went down instead
+        camera_offset = int(camera_offset) # just in case
+        adjusted_bounds = bounds.offset(DIRECTION_MAP_XY[direction] * camera_offset)
+
+        # basically height comparison: rooms should have non-contradictory heights to match
+        if adjusted_bounds.to_rect()[max_index] > anchor_bounds.to_rect()[max_index] or \
+            adjusted_bounds.to_rect()[min_index] < anchor_bounds.to_rect()[min_index]:
+            return False, 0
+
+        return True, camera_offset
+
+        ###
+        ###
+        ### reference solution
+        if False:
+            if direction == 'up': # aka increasing Y coord (of camera, rooms' y is decreasing)
+                if adjusted_bounds.x_min != anchor_bounds.x_min and adjusted_bounds.x_max != anchor_bounds.x_max:
+                    return False, 0
+
+                # only limits along pan direction can change
+                for x in different_limits:
+                    if is_horizontal(x): return False, 0
+
+                if 'up' not in shared_limits: # choose anchor side
+                    camera_offset = anchor_bounds.y_max - bounds.y_max
+                else:
+                    camera_offset = anchor_bounds.y_min - bounds.y_min
+
+                if camera_offset < 0: return False, 0 # that would mean camera went down instead
+                adjusted_bounds = bounds.offset(DIRECTION_MAP_XY['up'] * camera_offset)
+
+                # basically height comparison: rooms should have non-contradictory heights to match
+                if adjusted_bounds.y_max > anchor_bounds.y_max or adjusted_bounds.y_min < anchor_bounds.y_min:
+                    return False, 0
+
+                return True, camera_offset
+        ###
+        ###
+        ###
+        
+    # direction is according to numerical direction, e.g. up means increasing Y, left means decreasing X
+    def estimate_camera_movement(self, pan_direction, target_distance, rooms, structural_rooms, update_camera_pos=True):
+        # we cannot start with room coordinate conversion since we don't know current camera position!
+
+        ### Step 0: process new rooms (compute limits and tag with visited/unvisited)
+        v_rooms, u_rooms = [], []
+        # set camera pos to 0 so that bounds stay as is
+        self._process_raw_inputs((0, 0), rooms, structural_rooms, v_rooms, u_rooms)
+        new_room_list = [('unvisited', *x) for x in u_rooms] + [('visited', *x) for x in v_rooms]
+
+        ### Step 1: Make a crop of all known rooms according to panning bounds
+        last_camera_bounds = self.screen_bounds.offset(self.last_camera_pos)
+        panning_bounds = get_panning_bounds(last_camera_bounds, pan_direction, self.map_bounds)
+
+        raw_room_list = [('unvisited', *x) for x in raw_unvisited_rooms] + [('visited', *x) for x in raw_visited_rooms]
+        cropped_rooms = []
+
+        for room_type, bounds, limits in raw_room_list:
+            crop = bounds.intersect(panning_bounds).collapse_negative()
+            if crop.area <= 0: continue
+
+            # this will make it way easier to compare local rooms' limits with known ones
+            new_limits = panning_bounds.touches_contained_bounds(crop)
+
+            # offset bounds to match as closely as possible with local coords (but it won't be exact!)
+            cropped_rooms.append((room_type, crop.offset(-self.last_camera_pos), new_limits))
+
+        ### Step 2: Match new rooms with known ones
+        matches = {} # distance: [*room_matches]
+
+        for room in new_room_list:
+            for anchor in cropped_rooms:
+                match, distance = self._room_match_exact(anchor, room, pan_direction)
+                if not match: continue
+                if distance not in matches:
+                    matches[distance] = 0
+                else:
+                    matches[distance] += 1
+        
+        ### Step 3: find best match distance
+        distances = list(matches.values())
+        max_matches = np.max(distances)
+        best_matches = [dist for dist, match_count in matches.items() if match_count == max_matches]
+        estimated_distance = best_matches[np.argmin(np.abs(np.array(best_matches) - target_distance))]
+
+        if update_camera_pos:
+            self.last_camera_pos = DIRECTION_MAP_XY[pan_direction] * estimated_distance + self.last_camera_pos
+            progress_log(f'Movement estimation: {estimated_distance} px. New position: {self.last_camera_pos}')
+
+        return estimated_distance
 
 ###
 ### ======================== MAIN ========================
@@ -129,11 +736,12 @@ def match_room_with_structural(structural_rooms, room_bounds):
 
 class FalloutShelterAutomationApp:
     # constants (?)
-    version = 'v0.7.0'
+    version = 'v0.8.0'
     app_update_interval_ms: int = 20
     "Controls how often does app make regular update iterations (e.g. updating displayed log, starting async tasks, etc.)"
     chord_start_sequence: str = '<ctrl>+f' # enter this key combination to start a chord
-
+    capture_name: str = 'Fallout Shelter' # window name to capture images from
+            # 'Mozilla Firefox' # 
     # mission script parameters (game related)
     camera_pan_deadzone_size: float = 0.04 # there are limits on how accurate you can pan camera using keys
     "Precision of camera panning - the center of the room should end up in a rectangle with dimensions camera_pan_deadzone_size * screen_shape"
@@ -160,6 +768,119 @@ class FalloutShelterAutomationApp:
     mission_paused = False # pauses mission script
     mock_mode = False # whether mock screen capture is used
     mask_escape_key = False # temporarily disables immediate shutdown when Esc is pressed
+    normal_room_height = None # we cache (approximate) height of rooms on default zoom here
+
+    ###
+    ### Game-aware tech [WIP]
+    ###
+
+    def build_initial_game_map(self):
+        ### make it so that camera barely sees top-left structural corner
+
+        if not self.mock_mode and False:
+            progress_log('Building map: fixing structural')
+            self.full_zoom_out()
+            did_down_pan = did_left_pan = did_up_pan = did_right_pan = False
+            previous_structural = None
+
+            while True:
+                structural, directions = detect_structural(self.next_frame())
+                panned = False
+
+                # camera moves up
+                if 'down' in directions:
+                    self.pan_camera('down', duration=0.03, post_pan_sleep=False)
+                    did_down_pan = True
+                    panned = True
+                # camera moves left
+                if 'left' in directions:
+                    self.pan_camera('left', duration=0.03, post_pan_sleep=False)
+                    did_left_pan = True
+                    panned = True
+
+                if not did_down_pan:
+                    if previous_structural is not None and did_up_pan and previous_structural.bounds == structural.bounds:
+                        structural.compute(patch_mask=True)
+                        previous_structural.compute(patch_mask=True)
+                        if np.all(structural.patch_mask == previous_structural.patch_mask):
+                            did_down_pan = True
+
+                    self.pan_camera('up', duration=0.03, post_pan_sleep=False)
+                    did_up_pan = True
+                    panned = True
+
+                if not did_left_pan:
+                    if previous_structural is not None and did_right_pan and previous_structural.bounds == structural.bounds:
+                        structural.compute(patch_mask=True)
+                        previous_structural.compute(patch_mask=True)
+                        if np.all(structural.patch_mask == previous_structural.patch_mask):
+                            did_left_pan = True
+
+                    self.pan_camera('right', duration=0.03, post_pan_sleep=False)
+                    did_right_pan = True
+                    panned = True
+
+                previous_structural = structural
+                if panned:
+                    sleep(camera_post_pan_duration)
+                    continue
+
+                break
+            
+            ### find the first room to start building map
+            progress_log('Building map: looking for a room')
+
+            for _ in slow_loop(interval=0, max_iter_count=25):
+                structural, directions = detect_structural(self.next_frame())
+                rooms = detect_structural_rooms(structural)
+
+                if rooms != []: break
+
+                self.pan_camera('up')
+
+            if rooms == []:
+                result_log('Building map: failed to find a starter room')
+                return False
+
+        ### Now camera should be seeing a room. Start building the map
+        progress_log('Building map: anchor set. Start building')
+        self.game_map_composer = GameMapComposer(self.screen_bounds)
+        self.game_map_composer.set_camera_position((0, 0))
+        create_debug_frame()
+
+        def draw_minimap(map):
+            minimap = map.render_mini_map(scale=5)
+            shape = minimap.shape[:2]
+            offset = 5
+            get_do()[offset:shape[0] + offset, offset:shape[1] + offset, :3] = minimap
+            get_do()[offset:shape[0] + offset, offset:shape[1] + offset, 3] = 255
+        
+        frame = self.next_frame()
+        structural, _ = detect_structural(frame)
+        str_rooms = detect_structural_rooms(structural)
+        rooms = detect_rooms(frame)
+
+        if rooms == [] and str_rooms == []:
+            result_log('ALERT: no rooms found, aborting')
+            return
+
+        while True:
+            self.game_map_composer.add_rooms(structural, rooms=rooms, structural_rooms=str_rooms)
+            draw_minimap(self.game_map_composer.compose())
+
+            discovery_direction = self.game_map_composer.get_current_discovery_direction()
+            if discovery_direction is None:
+                result_log('Building map complete')
+                break
+
+            self.pan_camera(discovery_direction, duration=0.03)
+            frame = self.next_frame()
+
+            structural, _ = detect_structural(frame)
+            str_rooms = detect_structural_rooms(structural)
+            rooms = detect_rooms(frame)
+
+            self.game_map_composer.estimate_camera_movement(*self.camera_pan_log[-1], rooms, str_rooms)
 
     ### 
     ### Game automation functions
@@ -181,14 +902,7 @@ class FalloutShelterAutomationApp:
 
     def get_panning_bounds(self, bounds, direction):
         "Returns Bounds to be used for screen grab when panning in `direction` and keeping `bounds` in view after panning"
-        if direction == 'left':
-            return Bounds(bounds.x_min, bounds.y_min, self.screen_shape_xy[0] - 1, bounds.y_max)
-        elif direction == 'right':
-            return Bounds(0, bounds.y_min, bounds.x_max, bounds.y_max)
-        elif direction == 'up':
-            return Bounds(bounds.x_min, 0, bounds.x_max, bounds.y_max)
-        elif direction == 'down':
-            return Bounds(bounds.x_min, bounds.y_min, bounds.x_max, self.screen_shape_xy[1] - 1)
+        return get_panning_bounds(bounds, direction, self.screen_bounds)
 
     def dialogue_random_handler(self, buttons):
         button_index = randrange(len(buttons))
@@ -222,9 +936,9 @@ class FalloutShelterAutomationApp:
             room_anchors = room_bounds.get_corners(get_8=True)
             furthest_anchor_i = np.argmax([np.linalg.norm(x) for x in np.array(room_anchors) - self.screen_center_xy])
             zoom_point = self.filter_mouse_coords(*room_anchors[furthest_anchor_i])
-            self.zoom_in(*zoom_point)
+            self.zoom_camera(*zoom_point)
             progress_log('zoomed in, rediscovering room...')
-            rooms = detect_rooms(self.latest_frame)
+            rooms = detect_rooms(self.next_frame())
             if len(rooms) == 0:
                 progress_log('Navigation: target lost')
                 return False, None, None, None
@@ -232,6 +946,9 @@ class FalloutShelterAutomationApp:
             # find room closest to where we had cursor for zooming in
             vectors_norms = [[np.linalg.norm(np.array(corner) - zoom_point) for corner in z.get_corners()] for x, y, z in rooms]
             room_bounds = rooms[np.argmin([np.min(norms) for norms in vectors_norms])][2]
+
+            if self.normal_room_height is None:
+                self.normal_room_height = room_bounds.height
 
         ### Camera panning to center the room on the screen
         distance_multiplier = 1 # needed to avoid infinite panning loops
@@ -427,7 +1144,7 @@ class FalloutShelterAutomationApp:
     
         return len(meds) > 0, len(crits) > 0
 
-    def zoom_out(self):
+    def full_zoom_out(self):
         full_delay_threshold = 0.2
         self.mouse_input.position = self.screen_center_xy
         init_screen = self.latest_frame
@@ -439,19 +1156,21 @@ class FalloutShelterAutomationApp:
             progress_log('Zoom-out: full delay')
         self.zoomed_out = True
 
-    def zoom_in(self, x, y):
+    def zoom_camera(self, x, y, zoom_duration=0.75, zoom_out=False):
         "Zooms in while focusing on specified point. After zoom-in a 3-slot room should still fit on screen + a bit of extra space around"
-        zoom_in_duration = 0.75
         self.mouse_input.position = self.filter_mouse_coords(x, y)
-        self.keyboard_input.press('e')
-        sleep(zoom_in_duration)
-        self.keyboard_input.release('e')
-        sleep(0.1)
-        self.zoomed_out = False
+        zoom_key = 'q' if zoom_out else 'e'
+        self.keyboard_input.press(zoom_key)
+        sleep(zoom_duration)
+        self.keyboard_input.release(zoom_key)
+        # experimenting without this sleep
+        # sleep(0.1)
+        if not zoom_out:
+            self.zoomed_out = False
 
     def look_for_room_using_structural(self):
         "Returns true if at least one unvisited room has been found and is on screen right now"
-        self.zoom_out()
+        self.full_zoom_out()
         reached_left, reached_right = False, False
         direction = 'down' # camera actually goes up
     
@@ -547,7 +1266,7 @@ class FalloutShelterAutomationApp:
 
         self.last_iteration_room_detected = False
         if self.need_zoom_out and not self.zoomed_out:
-            self.zoom_out()
+            self.full_zoom_out()
         debug_log_image(self.freeze_frame(), 'iteration-capture')
         self.battle_iteration() # meds / level-ups should be clicked
 
@@ -858,12 +1577,76 @@ class FalloutShelterAutomationApp:
 
         return filtered_coords
 
+    def structural_pan(self, direction, distance, room_bounds):
+        pan_step = 200
+        
+        progress_log(f'Starting panning, location: {room_bounds}')
+        while distance > 0:
+            current_distance = min(pan_step, distance)
+            distance -= pan_step 
+
+            self.pan_camera(direction, distance=current_distance)
+            rescan_bounds = self.get_panning_bounds(room_bounds, direction).get_scaled_from_center(scale=1.2)
+
+            structural, _ = detect_structural(self.next_frame()[rescan_bounds.to_slice()])
+            rooms = [x.offset(rescan_bounds.low_pos) for x in detect_structural_rooms(structural)]
+            if rooms == []: return None
+            room_bounds = rooms[np.argmin([np.linalg.norm(np.array(room_bounds.pos) - x.pos) for x in rooms])]
+            progress_log(f'New room location: {room_bounds}')
+
+            # delta = np.linalg.norm(np.array(room_bounds.pos) - orig_pos)
+
+    def pan_camera_for_looting(self):
+        if self.loot_camera_position >= 2: return False
+        progress_log(f'Starting camera pan for looting: {self.loot_camera_position}')
+        bounds = self.current_room_bounds
+
+        # fix camera zoom
+        if self.dialogue_detected and self.normal_room_height is not None:
+            # actual / base : high -> low
+            room_height_threshold = 1.05 # this or lower
+            progress_log(f'Starting zoom out, threshold: {room_height_threshold}')
+            
+            while bounds.height / self.normal_room_height <= room_height_threshold:
+                self.zoom_camera(*bounds.pos, zoom_duration=0.05, zoom_out=True)
+                structural, _ = detect_structural(self.next_frame())
+                rooms = detect_structural_rooms(structural)
+                rooms = [x for x in rooms if x.contains_point(bounds.pos)]
+                if rooms == []:
+                    result_log(f'Error: lost target room')
+                    return False
+
+                bounds = rooms[0]
+            progress_log(f'Zoom in complete')
+
+        # pan left
+        if self.loot_camera_position == 0:
+            room_ratio = self.current_room_bounds.width / self.current_room_bounds.height
+            obscure_fraction = (room_ratio - 0.6) ** 2 / 100
+            self.obscure_amount = int(obscure_fraction * self.current_room_bounds.width)
+
+            pan_distance = self.current_room_bounds.x_min + self.obscure_amount
+            self.current_room_bounds = self.structural_pan('left', pan_distance, bounds)
+        # pan right
+        else:
+            pan_distance = self.screen_shape_xy[0] - self.current_room_bounds.x_max + self.obscure_amount
+            self.current_room_bounds = self.structural_pan('right', pan_distance, bounds)
+
+        if self.current_room_bounds:
+            result_log(f'Error: lost room during panning')
+            return False
+        draw_border(get_do(), self.current_room_bounds, np.array([255, 150, 0, 255]), thickness=5)
+
+        self.loot_camera_position += 1
+        return True
+
     def loot_collection_task(self):
         progress_log(f'Starting loot collection')
         # enemies leave more loot, increase attempt count
         scan_attempts = 3 if self.enemies_detected else 2
 
         self.loot_click_locations = []
+        self.loot_camera_position = 0
 
         if not self.loot_bound_detected:
             progress_log(f'Waiting for loot bound detection...')
@@ -879,7 +1662,11 @@ class FalloutShelterAutomationApp:
             scan_attempts -= 1
 
             if len(loot_coords) == 0:
-                if scan_attempts < 1: break
+                if scan_attempts < 1:
+                    if self.pan_camera_for_looting():
+                        scan_attempts += 1
+                        continue
+                    break
                 sleep(0.25) # small delay to get new frames
                 continue
             
@@ -914,7 +1701,12 @@ class FalloutShelterAutomationApp:
             
             if self.loot_collection_cancelled: return
             self.hide_ui_panels() # doing the last to not influence diff detection
-            if scan_attempts < 1: break
+            if scan_attempts < 1:
+                if self.pan_camera_for_looting():
+                    scan_attempts += 1
+                    continue
+                
+                break
         
         self.loot_collected = True
     
@@ -971,7 +1763,7 @@ class FalloutShelterAutomationApp:
         self.screen_frames_lock = threading.Lock()
         self.capture_thread = threading.Thread(target=self.capture_worker)
         self.capture_thread.start()
-        while not hasattr(self, 'latest_frame'): pass # get capture thread started
+        while self.latest_frame is None: pass # get capture thread started
 
     def capture_worker(self):
         "to be launched in a separate thread - continually captures the screen"
@@ -1005,6 +1797,7 @@ class FalloutShelterAutomationApp:
         self.screen_frames_lock.acquire()
         buffer_copy = self.screen_frames[:]
         self.screen_frames_lock.release()
+        if len(buffer_copy) == 0: return buffer_copy
 
         i = -2 # index -1 should never be deleted, start with -2
         while -i < len(buffer_copy):
@@ -1080,7 +1873,7 @@ class FalloutShelterAutomationApp:
     ### App initialization
     ###
 
-    def __init__(self, force_pil_capture=False, mock_frames_path=None, disable_image_logging=False):
+    def __init__(self, force_pil_capture=False, mock_frames_path=None, disable_image_logging=False, fixed_mock_frame=False):
         self.dialogue_handlers = {
             'random': self.dialogue_random_handler,
             'manual': self.dialogue_manual_handler
@@ -1090,7 +1883,7 @@ class FalloutShelterAutomationApp:
         self.execution_target_chord_map = {
              # replace with whatever you need at the time
             # '`': (lambda x: debug_detect_generic_loot(grab_screen_func=x.no_overlay_grab_screen, mock_mode=self.mock_mode), 'temp debug function', False),
-            '`': (FalloutShelterAutomationApp.debug_test_loot_click_dispersion, 'temp debug function', False),
+            '`': (FalloutShelterAutomationApp.build_initial_game_map, 'temp debug function', False),
             'm': (lambda x: detect_med_buttons(x.no_overlay_grab_screen()), 'meds detection', True),
             'c': (lambda x: detect_critical_button(x.no_overlay_grab_screen()), 'critical cue detection', True),
             'r': (lambda x: detect_rooms(x.no_overlay_grab_screen()), 'rooms detection', True),
@@ -1119,6 +1912,8 @@ class FalloutShelterAutomationApp:
         self.recent_click_coords = []
         self.recent_click_timestamps = []
         self.loot_click_locations = []
+        self.latest_frame = None
+        self.camera_pan_log = []
 
         self.max_screen_frames = 250                     # kind of arbitrary (~1500 MB for 1920x1080 frames)
         self.screen_frame_max_age = 3                    # (seconds) (probably can be reduced, 3 seconds for debug reasons)
@@ -1126,20 +1921,26 @@ class FalloutShelterAutomationApp:
         self.force_pil_capture = force_pil_capture
         self.mock_frames_path = mock_frames_path
         self.disable_image_logging = disable_image_logging
+        self.fixed_mock_frame = fixed_mock_frame
+
+        if fixed_mock_frame and mock_frames_path is None:
+            print('Error: cannot use fixed mock frame if no frame path is specified')
+            quit()
 
     def run(self):
         print('Welcome to FSA! Initializing...')
         
         native_capture = not self.force_pil_capture
         if self.mock_frames_path is not None:
-            self.grab_screen, self.native_grab_screen = init_screen_capture(mode='mock', mock_directory=self.mock_frames_path)
+            mock_mode = 'fixed' if self.fixed_mock_frame else 'frames'
+            self.grab_screen, self.native_grab_screen = init_screen_capture(mode='mock', mock_directory=self.mock_frames_path, mock_mode=mock_mode)
             set_max_debug_frames(10)
             self.mock_mode = True
             set_debug_log_images_enabled(enabled=False) # do not log frames
             self.log_mock_frames_path()
             self.set_screen_shape(np.array(get_mock_frames()[0].shape[:2]))
         else:
-            self.grab_screen, self.native_grab_screen = init_screen_capture(mode='real', window_title='Fallout Shelter', use_native=native_capture)
+            self.grab_screen, self.native_grab_screen = init_screen_capture(mode='real', window_title=self.capture_name, use_native=native_capture)
             self.set_screen_shape(np.array(self.grab_screen(None).shape[:2]))
             if self.disable_image_logging:
                 set_debug_log_images_enabled(enabled=False)
@@ -1322,17 +2123,24 @@ class FalloutShelterAutomationApp:
         self.recent_click_coords.append((x, y))
         self.recent_click_timestamps.append(perf_counter())
 
-    def pan_camera(self, direction, duration=None, distance=None):
+    def pan_camera(self, direction, duration=None, distance=None, post_pan_sleep=True):
         if duration is None and distance is None:
             distance = self.camera_default_pan_distance
         
         if distance is not None:
             if duration is not None: raise Exception('duration and distance cannot both be set')
             duration = distance / self.camera_pan_velocity
+        
+        if duration < 0:
+            result_log(f'Warning: cannot pan for {duration:0.1f} s, aborting')
+            return
 
         self.keyboard_input.press(CAMERA_PAN_KEYS[direction])
         sleep(duration)
         self.keyboard_input.release(CAMERA_PAN_KEYS[direction])
+        if post_pan_sleep: sleep(camera_post_pan_duration)
+
+        self.camera_pan_log.append((direction, duration * self.camera_pan_velocity))
 
     ####
     #### App internals functions
@@ -1496,7 +2304,8 @@ class FalloutShelterAutomationApp:
                     capture_string += 'disabled'
                 else:
                     frames = self.copy_frames_buffer(max_total_duration=2)
-                    fps = len(frames) / (frames[-1][1] - frames[0][1])
+                    duration = frames[-1][1] - frames[0][1]
+                    fps = len(frames) / duration if duration > 0 else float('NaN')
                     capture_string += f'{fps:0.1f} FPS'
 
                 status = timing_string + capture_string
@@ -1710,6 +2519,15 @@ class FalloutShelterAutomationApp:
             sleep(0.05)
         self.overlay_update_interval = update_interval
 
+    def debug_test_instant_pan(self):
+        self.pan_camera('left', duration=0)
+        sleep(1)
+        self.pan_camera('right', duration=0)
+        sleep(1)
+        self.pan_camera('up', duration=0)
+        sleep(1)
+        self.pan_camera('down', duration=0)
+
 ###
 ### static void main string args
 ###
@@ -1719,7 +2537,8 @@ if __name__ == '__main__':
     parser.add_argument('--force-pil-capture', action='store_true', help='Force screen capture using PIL (no native window capturing)')
     parser.add_argument('--mock-frames-path', type=str, help='Specify directory for mock frames (also enables mock screen capture). Either provide path to folder with frames, or to folder of folders with frames')
     parser.add_argument('--disable-image-logging', action='store_true', default=False, help='Disables logging images as files')
+    parser.add_argument('--fixed-mock-frame', action='store_true', help='When using mock mode, allows to use a single frame repeatedly')
     args = parser.parse_args()
 
-    app = FalloutShelterAutomationApp(force_pil_capture=args.force_pil_capture, mock_frames_path=args.mock_frames_path, disable_image_logging=args.disable_image_logging)
+    app = FalloutShelterAutomationApp(force_pil_capture=args.force_pil_capture, mock_frames_path=args.mock_frames_path, disable_image_logging=args.disable_image_logging, fixed_mock_frame=args.fixed_mock_frame)
     app.run()
